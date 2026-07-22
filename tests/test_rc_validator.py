@@ -9,6 +9,8 @@ from researchclaw.experiment.validator import (
     DANGEROUS_CALLS,
     CodeValidation,
     ValidationIssue,
+    auto_fix_unbound_locals,
+    check_filename_collisions,
     extract_imports,
     format_issues_for_llm,
     validate_code,
@@ -351,3 +353,88 @@ def test_code_validation_summary_for_errors_and_warnings():
     )
 
     assert validation.summary() == "Code validation: 1 error(s), 1 warning(s)"
+
+
+# ---------------------------------------------------------------------------
+# check_filename_collisions (BUG-202)
+# ---------------------------------------------------------------------------
+
+
+def test_filename_collision_detects_config_py():
+    """BUG-202: config.py shadows pip 'config' package."""
+    warnings = check_filename_collisions({"config.py": "x = 1", "main.py": "print(1)"})
+    assert len(warnings) == 1
+    assert "shadows stdlib/pip" in warnings[0]
+    assert "config" in warnings[0]
+
+
+def test_filename_collision_detects_stdlib_shadows():
+    """Filenames shadowing stdlib modules should be flagged."""
+    warnings = check_filename_collisions({"json.py": "x = 1"})
+    assert len(warnings) == 1
+    assert "json" in warnings[0]
+
+
+def test_filename_collision_allows_safe_names():
+    """Normal experiment filenames should not trigger warnings."""
+    files = {
+        "main.py": "print(1)",
+        "models.py": "class M: pass",
+        "training.py": "def train(): pass",
+        "data_loader.py": "def load(): pass",
+        "experiment_config.py": "LR = 0.01",
+        "requirements.txt": "torch",
+    }
+    warnings = check_filename_collisions(files)
+    assert warnings == []
+
+
+def test_filename_collision_multiple_shadows():
+    """Multiple shadowing files should each produce a warning."""
+    files = {"config.py": "", "logging.py": "", "main.py": ""}
+    warnings = check_filename_collisions(files)
+    assert len(warnings) == 2
+
+
+def test_auto_fix_does_not_clobber_loop_assigned_var():
+    """Regression: a variable assigned in a for-loop AND an if-branch must NOT
+    be pre-seeded with ``= None`` (that would clobber the loop's value)."""
+    code = (
+        "def compute(items, flag):\n"
+        "    for x in items:\n"
+        "        total = x * 2\n"
+        "    if flag:\n"
+        "        total = 0\n"
+        "    return total\n"
+    )
+    fixed, n = auto_fix_unbound_locals(code)
+    assert n == 0
+    assert "total = None" not in fixed
+
+
+def test_auto_fix_does_not_clobber_with_bound_var():
+    """A variable bound by a with-statement must not be pre-seeded either."""
+    code = (
+        "def g(flag, path):\n"
+        "    with open(path) as fh:\n"
+        "        data = fh.read()\n"
+        "    if flag:\n"
+        "        data = ''\n"
+        "    return data\n"
+    )
+    fixed, n = auto_fix_unbound_locals(code)
+    assert n == 0
+    assert "data = None" not in fixed
+
+
+def test_auto_fix_still_seeds_genuine_if_only_var():
+    """A variable assigned only inside an if-branch must still be fixed."""
+    code = (
+        "def f(flag):\n"
+        "    if flag:\n"
+        "        result = 1\n"
+        "    return result\n"
+    )
+    fixed, n = auto_fix_unbound_locals(code)
+    assert n >= 1
+    assert "result = None" in fixed

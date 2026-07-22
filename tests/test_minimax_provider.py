@@ -41,14 +41,14 @@ class _DummyHTTPResponse:
 def _make_minimax_client(
     *,
     api_key: str = "test-minimax-key",
-    primary_model: str = "MiniMax-M2.5",
+    primary_model: str = "MiniMax-M3",
     fallback_models: list[str] | None = None,
 ) -> LLMClient:
     config = LLMConfig(
-        base_url="https://api.minimax.io/v1",
+        base_url="https://api.minimaxi.com/v1",
         api_key=api_key,
         primary_model=primary_model,
-        fallback_models=fallback_models or ["MiniMax-M2.5-highspeed"],
+        fallback_models=fallback_models or ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
     )
     return LLMClient(config)
 
@@ -65,7 +65,7 @@ class TestMiniMaxPreset:
         assert "minimax" in PROVIDER_PRESETS
 
     def test_minimax_base_url(self):
-        assert PROVIDER_PRESETS["minimax"]["base_url"] == "https://api.minimax.io/v1"
+        assert PROVIDER_PRESETS["minimax"]["base_url"] == "https://api.minimaxi.com/v1"
 
 
 # ---------------------------------------------------------------------------
@@ -83,15 +83,15 @@ class TestMiniMaxFromRCConfig:
                 base_url="",
                 api_key="mk-test",
                 api_key_env="",
-                primary_model="MiniMax-M2.5",
-                fallback_models=("MiniMax-M2.5-highspeed",),
+                primary_model="MiniMax-M3",
+                fallback_models=("MiniMax-M2.7", "MiniMax-M2.7-highspeed"),
             ),
         )
         client = LLMClient.from_rc_config(rc_config)
-        assert client.config.base_url == "https://api.minimax.io/v1"
+        assert client.config.base_url == "https://api.minimaxi.com/v1"
         assert client.config.api_key == "mk-test"
-        assert client.config.primary_model == "MiniMax-M2.5"
-        assert client.config.fallback_models == ["MiniMax-M2.5-highspeed"]
+        assert client.config.primary_model == "MiniMax-M3"
+        assert client.config.fallback_models == ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]
 
     def test_from_rc_config_reads_minimax_api_key_from_env(self, monkeypatch):
         monkeypatch.setenv("MINIMAX_API_KEY", "env-minimax-key")
@@ -101,7 +101,7 @@ class TestMiniMaxFromRCConfig:
                 base_url="",
                 api_key="",
                 api_key_env="MINIMAX_API_KEY",
-                primary_model="MiniMax-M2.5",
+                primary_model="MiniMax-M3",
                 fallback_models=(),
             ),
         )
@@ -115,7 +115,7 @@ class TestMiniMaxFromRCConfig:
                 base_url="https://custom-proxy.example/v1",
                 api_key="mk-test",
                 api_key_env="",
-                primary_model="MiniMax-M2.5",
+                primary_model="MiniMax-M3",
                 fallback_models=(),
             ),
         )
@@ -147,7 +147,7 @@ class TestMiniMaxTemperatureClamping:
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         client._raw_call(
-            "MiniMax-M2.5",
+            "MiniMax-M3",
             [{"role": "user", "content": "hi"}],
             1024,
             temperature,
@@ -206,17 +206,20 @@ class TestMiniMaxModelChain:
 
     def test_model_chain_default(self):
         client = _make_minimax_client()
-        assert client._model_chain == ["MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
+        assert client._model_chain == [
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+            "MiniMax-M2.7-highspeed",
+        ]
 
     def test_model_chain_custom_fallbacks(self):
         client = _make_minimax_client(
             primary_model="MiniMax-M2.7",
-            fallback_models=["MiniMax-M2.5", "MiniMax-M2.5-highspeed"],
+            fallback_models=["MiniMax-M2.7-highspeed"],
         )
         assert client._model_chain == [
             "MiniMax-M2.7",
-            "MiniMax-M2.5",
-            "MiniMax-M2.5-highspeed",
+            "MiniMax-M2.7-highspeed",
         ]
 
 
@@ -238,7 +241,7 @@ class TestMiniMaxRawCall:
             captured["headers"] = {k.lower(): v for k, v in req.headers.items()}
             return _DummyHTTPResponse(
                 {
-                    "model": "MiniMax-M2.5",
+                    "model": "MiniMax-M3",
                     "choices": [{"message": {"content": "pong"}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
                 }
@@ -246,20 +249,22 @@ class TestMiniMaxRawCall:
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         resp = client._raw_call(
-            "MiniMax-M2.5",
+            "MiniMax-M3",
             [{"role": "user", "content": "ping"}],
             1024,
             0.5,
             False,
         )
-        assert captured["url"] == "https://api.minimax.io/v1/chat/completions"
-        assert captured["body"]["model"] == "MiniMax-M2.5"
+        assert captured["url"] == "https://api.minimaxi.com/v1/chat/completions"
+        assert captured["body"]["model"] == "MiniMax-M3"
         assert captured["body"]["temperature"] == 0.5
         assert captured["headers"]["authorization"] == "Bearer test-minimax-key"
         assert resp.content == "pong"
-        assert resp.model == "MiniMax-M2.5"
+        assert resp.model == "MiniMax-M3"
 
-    def test_json_mode_adds_response_format(self, monkeypatch):
+    def test_json_mode_uses_system_prompt_fallback(self, monkeypatch):
+        """MiniMax models don't support response_format — json_mode should
+        fall back to a system-prompt hint instead of sending the parameter."""
         client = _make_minimax_client()
         captured: dict[str, Any] = {}
 
@@ -271,13 +276,17 @@ class TestMiniMaxRawCall:
 
         monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
         client._raw_call(
-            "MiniMax-M2.5",
+            "MiniMax-M3",
             [{"role": "user", "content": "json"}],
             1024,
             0.5,
             True,
         )
-        assert captured["body"]["response_format"] == {"type": "json_object"}
+        # Should NOT have response_format (causes HTTP 400 on MiniMax)
+        assert "response_format" not in captured["body"]
+        # Should inject JSON hint into system message instead
+        msgs = captured["body"]["messages"]
+        assert any("JSON" in m.get("content", "") for m in msgs if m["role"] == "system")
 
 
 # ---------------------------------------------------------------------------
@@ -297,14 +306,15 @@ class TestMiniMaxCLI:
     def test_minimax_in_provider_urls(self):
         from researchclaw.cli import _PROVIDER_URLS
 
-        assert _PROVIDER_URLS["minimax"] == "https://api.minimax.io/v1"
+        assert _PROVIDER_URLS["minimax"] == "https://api.minimaxi.com/v1"
 
     def test_minimax_in_provider_models(self):
         from researchclaw.cli import _PROVIDER_MODELS
 
         primary, fallbacks = _PROVIDER_MODELS["minimax"]
-        assert primary == "MiniMax-M2.5"
-        assert "MiniMax-M2.5-highspeed" in fallbacks
+        assert primary == "MiniMax-M3"
+        assert "MiniMax-M2.7" in fallbacks
+        assert "MiniMax-M2.7-highspeed" in fallbacks
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +334,13 @@ class TestMiniMaxFactory:
                 base_url="",
                 api_key="mk-factory-test",
                 api_key_env="",
-                primary_model="MiniMax-M2.5",
+                primary_model="MiniMax-M3",
                 fallback_models=(),
             ),
         )
         client = create_llm_client(rc_config)
         assert isinstance(client, LLMClient)
-        assert client.config.base_url == "https://api.minimax.io/v1"
+        assert client.config.base_url == "https://api.minimaxi.com/v1"
         assert client._anthropic is None  # Not anthropic
 
 
@@ -355,14 +365,14 @@ class TestMiniMaxChatFallback:
             json_mode: bool,
         ) -> LLMResponse:
             calls.append(model)
-            if model == "MiniMax-M2.5":
+            if model == "MiniMax-M3":
                 raise RuntimeError("rate limited")
             return LLMResponse(content="ok", model=model)
 
         monkeypatch.setattr(LLMClient, "_call_with_retry", fake_call_with_retry)
         resp = client.chat([{"role": "user", "content": "test"}])
-        assert calls == ["MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
-        assert resp.model == "MiniMax-M2.5-highspeed"
+        assert calls == ["MiniMax-M3", "MiniMax-M2.7"]
+        assert resp.model == "MiniMax-M2.7"
 
 
 # ---------------------------------------------------------------------------
@@ -380,10 +390,10 @@ class TestMiniMaxLiveAPI:
     def _live_client(self) -> LLMClient:
         return LLMClient(
             LLMConfig(
-                base_url="https://api.minimax.io/v1",
+                base_url="https://api.minimaxi.com/v1",
                 api_key=os.environ["MINIMAX_API_KEY"],
-                primary_model="MiniMax-M2.5",
-                fallback_models=["MiniMax-M2.5-highspeed"],
+                primary_model="MiniMax-M3",
+                fallback_models=["MiniMax-M2.7", "MiniMax-M2.7-highspeed"],
                 max_tokens=64,
                 timeout_sec=60,
             )
@@ -411,7 +421,7 @@ class TestMiniMaxLiveAPI:
             json_mode=True,
             strip_thinking=True,
         )
-        # MiniMax M2.5 may wrap JSON in markdown code fences
+        # MiniMax models may wrap JSON in markdown code fences
         import re
         text = resp.content.strip()
         fence_match = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)

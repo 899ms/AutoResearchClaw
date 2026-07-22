@@ -37,6 +37,7 @@ openclaw_bridge:
 llm:
   provider: "openai-compatible"
   base_url: "https://api.openai.com/v1"
+  wire_api: "chat_completions"  # Set to "responses" for Responses-only gateways
   api_key_env: "OPENAI_API_KEY"
   api_key: ""
   primary_model: "gpt-4o"
@@ -46,9 +47,33 @@ llm:
   # --- MiniMax provider example ---
   # provider: "minimax"
   # api_key_env: "MINIMAX_API_KEY"
-  # primary_model: "MiniMax-M2.5"
+  # primary_model: "MiniMax-M3"
   # fallback_models:
-  #   - "MiniMax-M2.5-highspeed"
+  #   - "MiniMax-M2.7"
+  #   - "MiniMax-M2.7-highspeed"
+  # --- Ollama (local) example ---
+  # provider: "ollama"
+  # base_url: "http://localhost:11434/v1"
+  # api_key_env: ""
+  # api_key: "ollama"
+  # primary_model: "llama3.2"
+  # fallback_models:
+  #   - "mistral"
+
+literature_search:
+  # Stage 4 academic search backends. Defaults preserve the current
+  # OpenAlex -> Semantic Scholar -> arXiv order.
+  sources:
+    - "openalex"
+    - "semantic_scholar"
+    - "arxiv"
+  max_results_per_query: 40
+  inter_query_delay_sec: 1.5
+  openalex_email: "researchclaw@users.noreply.github.com"
+  openalex_api_key_env: "OPENALEX_API_KEY"
+  openalex_api_key: ""
+  s2_api_key_env: "S2_API_KEY"
+  s2_api_key: ""
 
 security:
   hitl_required_stages: [5, 9, 20]
@@ -188,6 +213,17 @@ experiment:
 # Copy prompts.default.yaml, edit the prompts you want, and set the path here.
 prompts:
   custom_file: ""  # e.g. "my_prompts.yaml" (empty = use built-in defaults)
+
+  # Per-stage additional guidance. Each key is a stage name (run
+  # `researchclaw info` to see the full stage list); each value is either
+  # an inline instruction or a path to a text/markdown file. The text is
+  # appended to that stage's user prompt under "## Additional Stage
+  # Guidance". Unknown stage names emit a warning and are dropped.
+  #
+  #   extra_prompts:
+  #     code_generation: "Favour MadGraph5 + Pythia8 + Delphes toolchains."
+  #     paper_outline: ./prompts/jhep_outline_rules.md
+  extra_prompts: {}
 
 
 # === MetaClaw Integration ===

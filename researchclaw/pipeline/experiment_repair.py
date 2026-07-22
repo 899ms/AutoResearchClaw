@@ -67,12 +67,14 @@ class ExperimentRepairResult:
     final_assessment: ExperimentQualityAssessment | None = None
     cycle_history: list[RepairCycleResult] = field(default_factory=list)
     best_experiment_summary: dict | None = None
+    skipped_reason: str | None = None
 
     def to_dict(self) -> dict:
         return {
             "success": self.success,
             "total_cycles": self.total_cycles,
             "final_mode": self.final_mode.value,
+            "skipped_reason": self.skipped_reason,
             "cycle_history": [
                 {
                     "cycle": cr.cycle,
@@ -318,6 +320,24 @@ def run_repair_loop(
             final_assessment=qa, best_experiment_summary=summary,
         )
 
+    # Simulated mode produces deterministic placeholder metrics by design
+    # (see _execute_experiment_run, mode == "simulated" branch). There is no
+    # sandbox-executable experiment to repair against, so calling
+    # create_sandbox() would raise "Unsupported experiment mode" three times
+    # and force a wasted pivot. Skip the loop and let Stage 15 see exactly
+    # what Stage 14 produced.
+    if getattr(config.experiment, "mode", None) == "simulated":
+        logger.info(
+            "[%s] Repair loop skipped: mode='simulated' has no real sandbox "
+            "to repair against.",
+            run_id,
+        )
+        return ExperimentRepairResult(
+            success=False, total_cycles=0, final_mode=qa.mode,
+            final_assessment=qa, best_experiment_summary=summary,
+            skipped_reason="simulated_mode",
+        )
+
     # Load experiment code
     code = _load_experiment_code(run_dir)
     if not code:
@@ -345,8 +365,10 @@ def run_repair_loop(
     cycle_history: list[RepairCycleResult] = []
     best_summary = summary
     best_mode = qa.mode
+    best_updated = False
     max_cycles = min(repair_cfg.max_cycles, MAX_REPAIR_CYCLES)
     loop_start = _time.monotonic()
+    prior_diagnoses: list[dict] = []
 
     for cycle in range(1, max_cycles + 1):
         logger.info("[%s] Repair cycle %d/%d starting...", run_id, cycle, max_cycles)
@@ -359,7 +381,9 @@ def run_repair_loop(
             refinement_log=ref_log,
             stdout=stdout,
             stderr=stderr,
+            prior_diagnoses=prior_diagnoses or None,
         )
+        prior_diagnoses.append(diag.to_dict() if hasattr(diag, "to_dict") else {})
 
         # 2. Build repair prompt
         repair_prompt = build_repair_prompt(
@@ -440,6 +464,7 @@ def run_repair_loop(
         if new_score > _summary_quality_score(best_summary):
             best_summary = new_summary
             best_mode = new_qa.mode
+            best_updated = True
 
         logger.info(
             "[%s] Repair cycle %d: score %.1f → %.1f, mode=%s, sufficient=%s",
@@ -476,8 +501,8 @@ def run_repair_loop(
         run_id, len(cycle_history), elapsed, best_mode.value,
     )
 
-    # Promote best summary if it's better than original
-    if best_summary != summary:
+    # Promote best summary only if a repair cycle actually improved it
+    if best_updated and best_summary is not summary:
         best_path = run_dir / "experiment_summary_best.json"
         best_path.write_text(json.dumps(best_summary, indent=2), encoding="utf-8")
 
@@ -836,6 +861,15 @@ def _build_experiment_summary_from_run(
             condition_summaries[cond_name]["metrics"][metric_name] = value
             seed_key = "/".join(parts[1:-1])
             condition_summaries[cond_name]["seeds"].setdefault(seed_key, {})[metric_name] = value
+        elif len(parts) == 2:
+            # BUG-199: Stage 13 refinement produces 2-part keys
+            # (condition_name/metric_name) without a seed component.
+            # Treat as a single-seed result.
+            cond_name, metric_name = parts
+            if cond_name not in condition_summaries:
+                condition_summaries[cond_name] = {"metrics": {}, "seeds": {}}
+            condition_summaries[cond_name]["metrics"][metric_name] = value
+            condition_summaries[cond_name]["seeds"].setdefault("0", {})[metric_name] = value
         elif len(parts) == 1:
             # Top-level metric like "primary_metric"
             pass

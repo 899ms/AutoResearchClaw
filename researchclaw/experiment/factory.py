@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from researchclaw.config import ExperimentConfig
 from researchclaw.experiment.sandbox import ExperimentSandbox, SandboxProtocol
+
+if TYPE_CHECKING:
+    from researchclaw.experiment.agentic_sandbox import AgenticSandbox
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +82,51 @@ def create_sandbox(config: ExperimentConfig, workdir: Path) -> SandboxProtocol:
 
         return ColabDriveSandbox(colab_cfg, workdir)
 
+    if config.mode == "collider_agent":
+        from researchclaw.experiment.collider_agent_sandbox import ColliderAgentSandbox
+
+        ca_cfg = config.collider_agent
+        return ColliderAgentSandbox(ca_cfg, workdir)
+
+    if config.mode == "biology_agent":
+        from researchclaw.experiment.biology_agent_sandbox import BiologyAgentSandbox
+
+        ba_cfg = config.biology_agent
+        return BiologyAgentSandbox(ba_cfg, workdir)
+
+    if config.mode == "stat_agent":
+        from researchclaw.experiment.stat_agent_sandbox import StatAgentSandbox
+
+        sa_cfg = config.stat_agent
+        return StatAgentSandbox(sa_cfg, workdir)
+
     if config.mode != "sandbox":
         raise RuntimeError(
             f"Unsupported experiment mode for create_sandbox(): {config.mode}"
         )
 
     return ExperimentSandbox(config.sandbox, workdir)
+
+
+def create_agentic_sandbox(
+    config: ExperimentConfig,
+    workdir: Path,
+    skills_dir: Path | None = None,
+) -> "AgenticSandbox":  # noqa: F821
+    """Return an :class:`AgenticSandbox` for agentic experiment mode.
+
+    Validates that Docker is available before returning.
+    """
+    from researchclaw.experiment.agentic_sandbox import AgenticSandbox
+
+    if not AgenticSandbox.check_docker_available():
+        raise RuntimeError(
+            "Docker daemon is not reachable. "
+            "Agentic mode requires Docker. Start Docker first."
+        )
+
+    agentic_cfg = config.agentic
+    if agentic_cfg.gpu_enabled:
+        logger.info("Agentic sandbox: GPU passthrough enabled")
+
+    return AgenticSandbox(agentic_cfg, workdir, skills_dir=skills_dir)

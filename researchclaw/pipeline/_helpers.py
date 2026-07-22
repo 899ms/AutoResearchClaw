@@ -53,6 +53,76 @@ _SANDBOX_SAFE_PACKAGES = {
 
 _METACLAW_SKILLS_DIR = str(Path.home() / ".metaclaw" / "skills")
 
+# User-level custom skills directory (cross-project)
+_USER_SKILLS_DIR = Path.home() / ".researchclaw" / "skills"
+
+# Lazy-initialized skill registry (singleton for the process)
+_skill_registry: object | None = None
+
+
+def _get_skill_registry(config: object | None = None) -> object:
+    """Return the global SkillRegistry, creating it on first call.
+
+    Loads skills from (in priority order):
+    1. Built-in skills shipped with the package
+    2. User-level ``~/.researchclaw/skills/``
+    3. Project-level ``.claude/skills/``
+    4. MetaClaw cross-run skills ``~/.metaclaw/skills/``
+    5. User-configured ``config.yaml → skills.custom_dirs``
+    """
+    global _skill_registry  # noqa: PLW0603
+    if _skill_registry is not None:
+        return _skill_registry
+    try:
+        from researchclaw.skills.registry import SkillRegistry
+
+        custom_dirs: list[str] = []
+
+        # User-level skills
+        if _USER_SKILLS_DIR.is_dir():
+            custom_dirs.append(str(_USER_SKILLS_DIR))
+
+        # Project-level .claude/skills/
+        project_skills = Path(__file__).resolve().parent.parent.parent / ".claude" / "skills"
+        if project_skills.is_dir():
+            custom_dirs.append(str(project_skills))
+
+        # MetaClaw skills
+        metaclaw = Path(_METACLAW_SKILLS_DIR)
+        if metaclaw.is_dir():
+            custom_dirs.append(str(metaclaw))
+
+        # Config-specified custom dirs
+        if config is not None:
+            skills_cfg = getattr(config, "skills", None)
+            if skills_cfg:
+                for d in getattr(skills_cfg, "custom_dirs", ()):
+                    if d:
+                        custom_dirs.append(str(d))
+                for d in getattr(skills_cfg, "external_dirs", ()):
+                    if d:
+                        custom_dirs.append(str(d))
+
+        _skill_registry = SkillRegistry(
+            custom_dirs=custom_dirs,
+            auto_match=True,
+            max_skills_per_stage=getattr(
+                getattr(config, "skills", None), "max_skills_per_stage", 3
+            ) if config else 3,
+            fallback_matching=True,
+        )
+        logger.info(
+            "Skill registry initialized: %d skills from %d sources",
+            _skill_registry.count(),
+            1 + len(custom_dirs),
+        )
+    except Exception:  # noqa: BLE001
+        # Fallback: create empty registry so we never crash
+        from researchclaw.skills.registry import SkillRegistry
+        _skill_registry = SkillRegistry(builtin_dir="/dev/null")
+        logger.debug("Skill registry init failed, using empty registry")
+    return _skill_registry
+
 # --- P1-1: Topic keyword extraction for domain pre-filter ---
 _STOP_WORDS = frozenset(
     {
@@ -235,7 +305,12 @@ def _build_fallback_queries(topic: str) -> list[str]:
 def _write_stage_meta(
     stage_dir: Path, stage: Stage, run_id: str, result: "StageResult"
 ) -> None:
-    next_stage = NEXT_STAGE[stage]
+    if result.status is StageStatus.DONE:
+        next_stage = NEXT_STAGE[stage]
+    else:
+        # Failed / paused / blocked stages should point back to themselves so
+        # retry-resume tooling does not imply that the pipeline advanced.
+        next_stage = stage
     meta = {
         "stage_id": f"{int(stage):02d}-{stage.name.lower()}",
         "run_id": run_id,
@@ -282,6 +357,7 @@ def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
             r = _sp.run(
                 [str(py_path), "-c", f"import {pkg}"],
                 capture_output=True, timeout=10,
+                encoding="utf-8", errors="replace",
             )
             if r.returncode != 0:
                 pip_name = "scikit-learn" if pkg == "sklearn" else pkg
@@ -289,6 +365,7 @@ def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
                 _sp.run(
                     [str(py_path), "-m", "pip", "install", pip_name, "--quiet"],
                     capture_output=True, timeout=120,
+                    encoding="utf-8", errors="replace",
                 )
                 installed.append(pip_name)
         except Exception as exc:
@@ -302,6 +379,19 @@ def _ensure_sandbox_deps(code: str, python_path: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Prior artifact I/O
 # ---------------------------------------------------------------------------
+
+
+def _read_best_analysis(run_dir: Path) -> str:
+    """BUG-225: Read analysis.md from the best Stage 14 iteration.
+
+    Prefers ``analysis_best.md`` at run root (written by
+    ``_promote_best_stage14``) over ``_read_prior_artifact("analysis.md")``
+    which may pick a degenerate non-versioned stage-14 directory.
+    """
+    best = run_dir / "analysis_best.md"
+    if best.exists():
+        return best.read_text(encoding="utf-8")
+    return _read_prior_artifact(run_dir, "analysis.md") or ""
 
 
 def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
@@ -321,7 +411,11 @@ def _read_prior_artifact(run_dir: Path, filename: str) -> str | None:
     for stage_subdir in sorted(run_dir.glob("stage-*"), key=_stage_sort_key, reverse=True):
         candidate = stage_subdir / filename
         if candidate.is_file():
-            return candidate.read_text(encoding="utf-8")
+            try:
+                return candidate.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as exc:
+                logger.warning("Cannot read %s: %s — skipping", candidate, exc)
+                continue
         if filename.endswith("/") and (stage_subdir / filename.rstrip("/")).is_dir():
             return str(stage_subdir / filename.rstrip("/"))
     return None
@@ -593,17 +687,35 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _parse_metrics_from_stdout(stdout: str) -> dict[str, Any]:
-    """Parse ``name: value`` metric lines from experiment stdout.
+    """Parse metric lines from experiment stdout.
 
-    Handles formats like ``UCB (Stochastic) cumulative_regret: 361.9233``
-    and simple ``loss: 0.0042``.  Returns a flat dict of metric_name → value.
+    Handles multiple formats:
+    - ``name: value`` (e.g. ``loss: 0.0042``)
+    - ``UCB (Stochastic) cumulative_regret: 361.9233``
+    - ``condition=name metric=value`` (per-condition output)
+    - ``condition=name/metric_name metric=value``
 
-    Filters out log/status lines (e.g. "Running experiments for support set
-    size: 1") using :func:`is_metric_name`.
+    Returns a flat dict of metric_name -> value.
+    Filters out log/status lines using :func:`is_metric_name`.
     """
+    # BUG-173: regex for condition=name metric=value format
+    _CONDITION_RE = re.compile(
+        r"^condition=(\S+)\s+metric=([0-9eE.+-]+)\s*$"
+    )
     metrics: dict[str, Any] = {}
     for line in stdout.splitlines():
         line = line.strip()
+        # --- Format 2: condition=xxx metric=yyy ---
+        m = _CONDITION_RE.match(line)
+        if m:
+            cond_name = m.group(1)
+            try:
+                fval = float(m.group(2))
+                metrics[cond_name] = fval
+            except (ValueError, TypeError):
+                pass
+            continue
+        # --- Format 1: name: value ---
         if ":" not in line:
             continue
         # Split on the LAST colon to handle names with colons
@@ -655,17 +767,26 @@ def _chat_with_prompt(
 
     messages = [{"role": "user", "content": user}]
     last_exc: Exception | None = None
+    _effective_json_mode = json_mode
     for attempt in range(1 + retries):
         try:
-            if json_mode and max_tokens is not None:
+            if _effective_json_mode and max_tokens is not None:
                 return llm.chat(messages, system=system, json_mode=True, max_tokens=max_tokens, strip_thinking=strip_thinking)
-            if json_mode:
+            if _effective_json_mode:
                 return llm.chat(messages, system=system, json_mode=True, strip_thinking=strip_thinking)
             if max_tokens is not None:
                 return llm.chat(messages, system=system, max_tokens=max_tokens, strip_thinking=strip_thinking)
             return llm.chat(messages, system=system, strip_thinking=strip_thinking)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
+            # Auto-disable json_mode on HTTP 400 — likely provider incompatibility
+            _err_str = str(exc)
+            if _effective_json_mode and "400" in _err_str:
+                logger.warning(
+                    "HTTP 400 with json_mode=True — disabling json_mode for retry "
+                    "(provider may not support response_format)."
+                )
+                _effective_json_mode = False
             if attempt < retries:
                 delay = 2 ** (attempt + 1)
                 logger.warning(
@@ -681,25 +802,54 @@ def _chat_with_prompt(
     raise last_exc  # type: ignore[misc]  # unreachable but satisfies type checker
 
 
-def _get_evolution_overlay(run_dir: Path | None, stage_name: str) -> str:
-    """Load evolution lessons + MetaClaw skills for prompt injection.
+def _get_evolution_overlay(
+    run_dir: Path | None,
+    stage_name: str,
+    *,
+    config: object | None = None,
+    topic: str = "",
+) -> str:
+    """Load evolution lessons + matched skills for prompt injection.
 
-    Combines intra-run lessons (from current run's evolution dir) with
-    cross-run arc-* skills (from ~/.metaclaw/skills/).
+    Combines three sources:
+    1. Intra-run lessons (from current run's evolution dir)
+    2. Cross-run MetaClaw skills (from ~/.metaclaw/skills/)
+    3. Matched skills from the SkillRegistry (builtin + user + external)
+
+    The SkillRegistry automatically matches skills to the current stage
+    using trigger keywords and stage applicability metadata.
 
     Returns empty string if no relevant lessons/skills exist or on any error.
     """
-    if run_dir is None:
-        return ""
-    try:
-        from researchclaw.evolution import EvolutionStore
+    parts: list[str] = []
 
-        store = EvolutionStore(run_dir / "evolution")
-        return store.build_overlay(
-            stage_name, max_lessons=5, skills_dir=_METACLAW_SKILLS_DIR
-        )
+    # --- Section 1: Evolution lessons + MetaClaw arc-* skills ---
+    if run_dir is not None:
+        try:
+            from researchclaw.evolution import EvolutionStore
+
+            store = EvolutionStore(run_dir / "evolution")
+            evo_overlay = store.build_overlay(
+                stage_name, max_lessons=5, skills_dir=_METACLAW_SKILLS_DIR
+            )
+            if evo_overlay:
+                parts.append(evo_overlay)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- Section 2: Matched skills from SkillRegistry ---
+    try:
+        registry = _get_skill_registry(config)
+        context = f"{stage_name} {topic}".strip()
+        matched = registry.match(context, stage_name)
+        if matched:
+            skills_text = registry.export_for_prompt(matched, max_chars=4000)
+            if skills_text:
+                parts.append(f"\n## Matched Domain Skills\n{skills_text}")
     except Exception:  # noqa: BLE001
-        return ""
+        pass
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +1068,7 @@ def _build_context_preamble(
         if plan:
             parts.append(f"\n### Experiment Plan\n{plan[:2000]}")
     if include_analysis:
-        analysis = _read_prior_artifact(run_dir, "analysis.md")
+        analysis = _read_best_analysis(run_dir)
         if analysis:
             parts.append(f"\n### Result Analysis\n{analysis[:2500]}")
     if include_decision:
@@ -948,6 +1098,17 @@ def _build_context_preamble(
                     parts.append(
                         f"\n### LaTeX Table\n```latex\n{summary['latex_table']}\n```"
                     )
+    # --- HITL guidance injection ---
+    for stage_dir in sorted(run_dir.glob("stage-*/hitl_guidance.md")):
+        try:
+            guidance = stage_dir.read_text(encoding="utf-8").strip()
+            if guidance:
+                stage_name = stage_dir.parent.name
+                parts.append(
+                    f"\n### Human Guidance ({stage_name})\n{guidance[:1000]}"
+                )
+        except (OSError, UnicodeDecodeError):
+            pass
     return "\n".join(parts)
 
 
@@ -1192,20 +1353,48 @@ def _extract_paper_title(md_text: str) -> str:
     Prioritises H1 headings that appear *before* the abstract section and
     look like real titles (>= 4 words, starts with uppercase).  This avoids
     picking up pseudocode comments or algorithm step labels.
+
+    Also handles the common LLM pattern where a ``# Title`` heading is
+    followed by the actual title as a plain text line (possibly bold):
+
+        # Title
+
+        NORM-PPO: Observation Normalization and Reward Scaling Effects
     """
     import re as _re
 
+    # Strip outer markdown fence (LLMs sometimes wrap entire paper)
+    _text = md_text
+    _fence_m = _re.match(r"^\s*```(?:markdown|md|latex|tex)?\s*\n", _text)
+    if _fence_m:
+        _text = _text[_fence_m.end():]
+        # Also strip trailing fence
+        _text = _re.sub(r"\n\s*```\s*$", "", _text)
+
     # Limit search to content before Abstract heading
     abstract_pos = _re.search(
-        r"^#{1,2}\s+(Abstract|ABSTRACT)", md_text, _re.MULTILINE
+        r"^#{1,2}\s+(Abstract|ABSTRACT)", _text, _re.MULTILINE
     )
-    search_region = md_text[: abstract_pos.start()] if abstract_pos else md_text[:3000]
+    search_region = _text[: abstract_pos.start()] if abstract_pos else _text[:3000]
 
     _SKIP = {"title", "abstract", "references", "appendix"}
     candidates: list[str] = []
+    _saw_title_heading = False
 
-    for line in search_region.splitlines():
-        line = line.strip()
+    lines = search_region.splitlines()
+    for i, raw_line in enumerate(lines):
+        line = raw_line.strip()
+
+        # BUG-171: When we see a "# Title" or "## Title" heading, the actual
+        # title is often on the next non-empty line as plain text or bold text.
+        if _saw_title_heading and line:
+            # Strip bold markers: **Title Text** → Title Text
+            candidate = _re.sub(r"\*\*(.+?)\*\*", r"\1", line).strip()
+            # Make sure it's not another heading or a skip heading
+            if not line.startswith("#") and candidate:
+                candidates.insert(0, candidate)  # highest priority
+            _saw_title_heading = False
+
         # Match H1 or H2 headings
         hm = _re.match(r"^(#{1,2})\s+(.+)$", line)
         if hm:
@@ -1216,8 +1405,13 @@ def _extract_paper_title(md_text: str) -> str:
                 heading = heading[6:].strip()
                 heading_lower = heading.lower()
             if heading_lower in _SKIP:
+                # Mark that we saw a "# Title" heading — next non-empty line
+                # is likely the actual title text
+                if heading_lower == "title":
+                    _saw_title_heading = True
                 continue
             candidates.append(heading)
+            continue
         # Bold title line (e.g. **My Paper Title**)
         m = _re.match(r"\*\*(.+?)\*\*$", line)
         if m and len(m.group(1).split()) >= 3:
@@ -1492,7 +1686,16 @@ def _multi_perspective_generate(
     Each role has its own system/user prompt. Outputs are saved to
     *perspectives_dir* and returned as ``{role_name: response_text}``.
     """
+    import os as _os  # noqa: PLC0415
     from researchclaw.prompts import _render  # noqa: PLC0415
+
+    # Ablation hook: ARC_ABL_DISABLE_DEBATE=1 collapses the debate to a
+    # single role so the multi-perspective synthesizer degenerates into a
+    # plain prompt. Used by experiments/component_ablation only.
+    if _os.environ.get("ARC_ABL_DISABLE_DEBATE", "").strip() == "1" and roles:
+        first_key = next(iter(roles))
+        roles = {first_key: roles[first_key]}
+        logger.info("ARC_ABL_DISABLE_DEBATE=1 — debate collapsed to role %s", first_key)
 
     perspectives_dir.mkdir(parents=True, exist_ok=True)
     results: dict[str, str] = {}

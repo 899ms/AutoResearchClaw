@@ -11,12 +11,15 @@ invoked via ``opencode run --format json "prompt"``.  This module provides:
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -355,16 +358,20 @@ class OpenCodeBridge:
             )
             if r.returncode != 0:
                 raise OSError(f"git init failed: {r.stderr}")
-            subprocess.run(
+            r = subprocess.run(
                 ["git", "add", "-A"],
                 cwd=str(ws), capture_output=True, timeout=10,
             )
-            subprocess.run(
+            if r.returncode != 0:
+                raise OSError(f"git add failed: {r.stderr}")
+            r = subprocess.run(
                 ["git", "-c", "user.email=beast@researchclaw",
                  "-c", "user.name=BeastMode",
                  "commit", "-m", "init workspace"],
                 cwd=str(ws), capture_output=True, timeout=10,
             )
+            if r.returncode != 0:
+                raise OSError(f"git commit failed: {r.stderr}")
         except subprocess.TimeoutExpired as exc:
             raise OSError(f"git workspace init timed out: {exc}") from exc
 
@@ -465,7 +472,7 @@ class OpenCodeBridge:
         # Use -m flag to specify model (more reliable than opencode.json)
         resolved_model = self._resolve_opencode_model()
         opencode_cmd = shutil.which("opencode") or "opencode"
-        cmd = [opencode_cmd, "run", "-m", resolved_model, "--format", "json", prompt]
+        cmd = self._build_opencode_command(opencode_cmd, resolved_model, prompt)
 
         t0 = time.monotonic()
         try:
@@ -474,6 +481,8 @@ class OpenCodeBridge:
                 cwd=str(workspace),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self._timeout_sec,
                 env=env,
             )
@@ -491,6 +500,38 @@ class OpenCodeBridge:
         except Exception as exc:  # noqa: BLE001
             elapsed = time.monotonic() - t0
             return False, f"Unexpected error: {exc}", elapsed
+
+    @staticmethod
+    def _build_opencode_command(
+        opencode_cmd: str, resolved_model: str, prompt: str
+    ) -> list[str]:
+        """Build the argv for ``opencode run``, wrapping with a pseudo-TTY on Linux.
+
+        The ``opencode`` CLI requires a TTY: when invoked via ``subprocess.run``
+        with piped stdout/stderr it can return exit 0 with empty output and no
+        generated files. On Linux we wrap the call with util-linux
+        ``script -q -e -c "<cmd>" /dev/null`` to provide a pseudo-TTY:
+
+        * ``-q`` suppresses ``script``'s start/done messages,
+        * ``-c`` runs the requested command,
+        * ``-e`` returns the child's exit status (without it ``script`` can
+          return 0 even when the child command fails, which would mask an
+          ``opencode`` failure as success — the very silent-success behaviour
+          this wrapper exists to avoid).
+
+        The wrapper is gated on Linux specifically because the
+        ``script -q -e -c ... /dev/null`` form is util-linux syntax; BSD/macOS
+        ``script`` implementations are not compatible with it. On non-Linux
+        platforms, and when ``script`` is unavailable, we fall back to invoking
+        ``opencode`` directly — i.e. the prior behaviour, no regression.
+        """
+        direct = [opencode_cmd, "run", "-m", resolved_model, "--format", "json", prompt]
+
+        script_path = shutil.which("script")
+        if sys.platform.startswith("linux") and script_path:
+            inner = " ".join(shlex.quote(part) for part in direct)
+            return [script_path, "-q", "-e", "-c", inner, "/dev/null"]
+        return direct
 
     # -- file collection -------------------------------------------------------
 
@@ -527,6 +568,104 @@ class OpenCodeBridge:
             if p.exists() and extra not in files:
                 files[extra] = p.read_text(encoding="utf-8", errors="replace")
 
+        return files
+
+    # -- entry-point validation ------------------------------------------------
+
+    @staticmethod
+    def _has_main_guard(source: str) -> bool:
+        """Return True if *source* contains ``if __name__ == "__main__":``."""
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                test = node.test
+                if isinstance(test, ast.Compare) and isinstance(test.left, ast.Name):
+                    if test.left.id == "__name__" and len(test.comparators) == 1:
+                        comp = test.comparators[0]
+                        if isinstance(comp, ast.Constant) and comp.value == "__main__":
+                            return True
+        return False
+
+    @staticmethod
+    def _ensure_main_entry_point(files: dict[str, str]) -> dict[str, str]:
+        """Ensure ``main.py`` has an ``if __name__ == "__main__"`` guard.
+
+        Beast Mode often generates multi-file projects where ``main.py`` is a
+        library module and the real entry point lives in another file (e.g.
+        ``run_experiment.py``).  Since the Docker sandbox always executes
+        ``python3 main.py``, a library-only ``main.py`` exits immediately with
+        no output.
+
+        Strategy:
+        1. If ``main.py`` already has the guard → return unchanged.
+        2. Find the first other ``.py`` file that **does** have the guard.
+        3. Swap: rename that file to ``main.py`` and the old ``main.py`` to a
+           helper module (its original basename, or ``_lib.py``).
+        4. If no file has a guard, append a minimal stub to ``main.py`` that
+           calls the most likely entry function (``main()``, ``run()``, etc.).
+        """
+        main_code = files.get("main.py", "")
+        if not main_code:
+            return files
+
+        if OpenCodeBridge._has_main_guard(main_code):
+            return files
+
+        # -- Strategy 2/3: find another file with the guard and swap -----------
+        for fname, code in files.items():
+            if fname == "main.py" or not fname.endswith(".py"):
+                continue
+            if OpenCodeBridge._has_main_guard(code):
+                logger.info(
+                    "Beast mode: main.py lacks __main__ guard; swapping "
+                    "entry point with %s",
+                    fname,
+                )
+                new_files = dict(files)
+                # Rename original main.py → helper module
+                helper_name = fname  # reuse the other file's name for old main
+                new_files[helper_name] = main_code
+                new_files["main.py"] = code
+                return new_files
+
+        # -- Strategy 4: inject a minimal entry point into main.py -------------
+        # Look for common entry functions defined in main.py
+        entry_func: str | None = None
+        try:
+            tree = ast.parse(main_code)
+            candidates = [
+                n.name
+                for n in ast.walk(tree)
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name in ("main", "run", "run_experiment", "train",
+                               "run_experiments", "experiment", "run_all")
+            ]
+            if candidates:
+                entry_func = candidates[0]
+        except SyntaxError:
+            pass
+
+        if entry_func:
+            logger.info(
+                "Beast mode: main.py lacks __main__ guard; injecting call "
+                "to %s()",
+                entry_func,
+            )
+            new_files = dict(files)
+            new_files["main.py"] = (
+                main_code.rstrip()
+                + "\n\n\nif __name__ == \"__main__\":\n"
+                + f"    {entry_func}()\n"
+            )
+            return new_files
+
+        logger.warning(
+            "Beast mode: main.py lacks __main__ guard and no known entry "
+            "function found — experiment may exit without producing output",
+        )
         return files
 
     # -- main entry point ------------------------------------------------------
@@ -601,6 +740,9 @@ class OpenCodeBridge:
                     if self._workspace_cleanup and workspace.exists():
                         shutil.rmtree(workspace, ignore_errors=True)
                     continue
+
+                # BUG-R52-01: Ensure main.py has an entry point
+                files = self._ensure_main_entry_point(files)
 
                 # Write log
                 try:

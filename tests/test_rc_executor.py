@@ -213,6 +213,40 @@ def test_read_prior_artifact_returns_none_when_not_found(run_dir: Path) -> None:
     assert rc_executor._read_prior_artifact(run_dir, "missing.md") is None
 
 
+def test_read_best_analysis_prefers_best_file(run_dir: Path) -> None:
+    """BUG-225: _read_best_analysis prefers analysis_best.md at run root."""
+    from researchclaw.pipeline._helpers import _read_best_analysis
+
+    # Create degenerate analysis in stage-14 and best at run root
+    s14 = run_dir / "stage-14"
+    s14.mkdir(parents=True)
+    (s14 / "analysis.md").write_text("Degenerate analysis", encoding="utf-8")
+    (run_dir / "analysis_best.md").write_text("Best analysis", encoding="utf-8")
+
+    result = _read_best_analysis(run_dir)
+    assert result == "Best analysis"
+
+
+def test_read_best_analysis_falls_back_to_prior_artifact(run_dir: Path) -> None:
+    """BUG-225: Falls back to _read_prior_artifact when no analysis_best.md."""
+    from researchclaw.pipeline._helpers import _read_best_analysis
+
+    s14 = run_dir / "stage-14"
+    s14.mkdir(parents=True)
+    (s14 / "analysis.md").write_text("Only analysis", encoding="utf-8")
+
+    result = _read_best_analysis(run_dir)
+    assert result == "Only analysis"
+
+
+def test_read_best_analysis_returns_empty_when_none(run_dir: Path) -> None:
+    """BUG-225: Returns empty string when no analysis exists at all."""
+    from researchclaw.pipeline._helpers import _read_best_analysis
+
+    result = _read_best_analysis(run_dir)
+    assert result == ""
+
+
 def test_write_stage_meta_writes_expected_json(run_dir: Path) -> None:
     stage_dir = run_dir / "stage-01"
     stage_dir.mkdir()
@@ -236,6 +270,29 @@ def test_write_stage_meta_writes_expected_json(run_dir: Path) -> None:
     assert payload["evidence_refs"] == ["stage-01/goal.md"]
     assert payload["next_stage"] == 2
     assert re.match(r"\d{4}-\d{2}-\d{2}T", payload["ts"])
+
+
+def test_write_stage_meta_keeps_paused_stage_as_next_stage(run_dir: Path) -> None:
+    stage_dir = run_dir / "stage-02"
+    stage_dir.mkdir()
+    result = rc_executor.StageResult(
+        stage=Stage.PROBLEM_DECOMPOSE,
+        status=StageStatus.PAUSED,
+        artifacts=("refinement_log.json",),
+        decision="resume",
+        error="ACP prompt timed out after 1800s",
+        evidence_refs=("stage-02/refinement_log.json",),
+    )
+    rc_executor._write_stage_meta(
+        stage_dir, Stage.PROBLEM_DECOMPOSE, "run-paused", result
+    )
+    payload = cast(
+        dict[str, Any],
+        json.loads((stage_dir / "decision.json").read_text(encoding="utf-8")),
+    )
+    assert payload["status"] == "paused"
+    assert payload["decision"] == "resume"
+    assert payload["next_stage"] == int(Stage.PROBLEM_DECOMPOSE)
 
 
 def test_execute_stage_creates_stage_dir_writes_artifacts_and_meta(
@@ -717,6 +774,45 @@ class TestIterativeRefine:
         assert payload["stop_reason"] == "llm_unavailable"
         assert result.status == StageStatus.DONE
 
+    def test_refine_acp_timeout_pauses_for_resume(
+        self,
+        run_dir: Path,
+        rc_config: RCConfig,
+        adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._prepare_refine_inputs(run_dir)
+        stage_dir = run_dir / "stage-13"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        from researchclaw.pipeline.stage_impls import _execution as execution_impl
+
+        def _timeout(*args, **kwargs):
+            _ = args, kwargs
+            raise RuntimeError("ACP prompt timed out after 1800s")
+
+        monkeypatch.setattr(execution_impl, "_chat_with_prompt", _timeout)
+
+        result = rc_executor._execute_iterative_refine(
+            stage_dir,
+            run_dir,
+            rc_config,
+            adapters,
+            llm=FakeLLMClient("unused"),
+        )
+
+        payload = json.loads(
+            (stage_dir / "refinement_log.json").read_text(encoding="utf-8")
+        )
+        assert result.status == StageStatus.PAUSED
+        assert result.decision == "resume"
+        assert result.artifacts == ("refinement_log.json",)
+        assert payload["paused"] is True
+        assert payload["stop_reason"] == "acp_prompt_timeout"
+        assert payload["pause_iteration"] == 1
+        assert payload["best_version"] == "experiment/"
+        assert not (stage_dir / "experiment_final").exists()
+
     def test_refine_with_llm_generates_improved_code(
         self,
         run_dir: Path,
@@ -1147,8 +1243,11 @@ class TestTopicConstraintBlock:
 
 
 class TestParseDecision:
-    def test_proceed_default(self) -> None:
-        assert rc_executor._parse_decision("Some random text") == "proceed"
+    def test_no_keyword_returns_none(self) -> None:
+        # Without a PROCEED/PIVOT/REFINE keyword the parser must NOT default
+        # to "proceed" — that previously caused inconclusive model output
+        # to silently advance the pipeline. See researchclaw_rung_b_mapping.md.
+        assert rc_executor._parse_decision("Some random text") is None
 
     def test_proceed_explicit(self) -> None:
         text = "## Decision\nPROCEED\n## Justification\nGood results."
@@ -1219,6 +1318,112 @@ class TestResearchDecisionStructured:
             stage_dir, run_dir, rc_config, adapters, llm=None
         )
         assert result.decision == "proceed"
+
+    def test_ambiguous_llm_response_pauses(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        # Inconclusive LLM prose with no PROCEED/PIVOT/REFINE keyword must
+        # pause the pipeline rather than silently advancing as "proceed".
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-15"
+        stage_dir.mkdir(parents=True)
+        _write_prior_artifact(run_dir, 14, "analysis.md", "# Analysis\nMixed results.")
+        fake_llm = FakeLLMClient(
+            "After reviewing the results, the experimental evidence is "
+            "inconclusive and additional data collection is needed."
+        )
+        result = rc_executor._execute_research_decision(
+            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+        )
+        assert result.status == StageStatus.PAUSED
+        assert result.decision == "undecided"
+        import json
+        data = json.loads((stage_dir / "decision_structured.json").read_text())
+        assert data["decision"] is None
+        assert data["decision_parse_failed"] is True
+
+
+class TestExperimentDesignGuard:
+    # The schema-deficit guard added in _execute_experiment_design uses
+    # _normalize_plan_field so that valid non-list field shapes (str, dict,
+    # list[str], list[dict]) — which the rest of the file already supports
+    # via _normalize_plan_field at the trim/conditions logic — do NOT
+    # falsely trigger a PAUSED outcome.
+
+    def test_normalize_string_returns_non_empty(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _normalize_plan_field
+        assert _normalize_plan_field("standard ResNet baseline") == [
+            "standard ResNet baseline"
+        ]
+
+    def test_normalize_dict_returns_non_empty(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _normalize_plan_field
+        result = _normalize_plan_field({"groupnorm": "GroupNorm replacement"})
+        assert len(result) == 1
+        assert result[0]["name"] == "groupnorm"
+
+    def test_normalize_none_returns_empty(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _normalize_plan_field
+        assert _normalize_plan_field(None) == []
+
+    def test_normalize_empty_string_returns_empty(self) -> None:
+        from researchclaw.pipeline.stage_impls._experiment_design import _normalize_plan_field
+        assert _normalize_plan_field("") == []
+
+    def test_empty_dict_response_pauses(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        # When the LLM returns "{}" the plan parses to an empty dict, every
+        # fallback cascade is skipped (plan is never None), and the new
+        # schema-deficit guard must pause rather than ship an exp_plan.yaml
+        # with nothing but topic.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-09"
+        stage_dir.mkdir(parents=True)
+        _write_prior_artifact(
+            run_dir, 8, "hypotheses.md",
+            "# Hypotheses\n\nGeneral statements with no extractable method names.\n",
+        )
+        fake_llm = FakeLLMClient("{}")
+        result = rc_executor._execute_experiment_design(
+            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+        )
+        assert result.status == StageStatus.PAUSED
+        assert result.decision == "schema_deficient"
+        assert (stage_dir / "plan_meta.json").exists()
+        assert not (stage_dir / "exp_plan.yaml").exists()
+        import json
+        meta = json.loads((stage_dir / "plan_meta.json").read_text())
+        assert meta["outcome"] == "model_response_schema_deficient"
+        assert set(meta["missing_required_keys"]) == {
+            "baselines", "proposed_methods", "ablations",
+        }
+
+
+class TestResourcePlanningFallback:
+    def test_wrong_schema_falls_back_to_template(
+        self, tmp_path: Path, rc_config: RCConfig, adapters: AdapterBundle
+    ) -> None:
+        # A parseable wrong-schema dict (no `tasks` key) must trigger the
+        # template fallback rather than silently being accepted as the
+        # schedule. The output must still satisfy the contract (DONE +
+        # `tasks` populated) and record the source in `_meta`.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        stage_dir = run_dir / "stage-11"
+        stage_dir.mkdir(parents=True)
+        fake_llm = FakeLLMClient('{"unrelated_key": "value"}')
+        result = rc_executor._execute_resource_planning(
+            stage_dir, run_dir, rc_config, adapters, llm=fake_llm
+        )
+        assert result.status == StageStatus.DONE
+        import json
+        schedule = json.loads((stage_dir / "schedule.json").read_text())
+        assert isinstance(schedule.get("tasks"), list)
+        assert len(schedule["tasks"]) >= 2
+        assert schedule["_meta"]["source"] == "template"
 
 
 class TestMultiPerspectiveGenerate:
@@ -2048,7 +2253,8 @@ class TestDataIntegrityBlock:
     """Test paper draft blocked when no metrics exist (R4-2a)."""
 
     def test_paper_draft_blocked_with_no_metrics(
-        self, tmp_path: Path, run_dir: Path, rc_config: RCConfig, adapters: AdapterBundle
+        self, tmp_path: Path, run_dir: Path, rc_config: RCConfig, adapters: AdapterBundle,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Write prior artifacts with NO metrics
         _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
@@ -2063,14 +2269,65 @@ class TestDataIntegrityBlock:
         stage_dir = run_dir / "stage-17"
         stage_dir.mkdir(parents=True, exist_ok=True)
 
+        # Ensure domain detection returns an empirical domain so the block triggers
+        from researchclaw.pipeline.stage_impls import _paper_writing
+        monkeypatch.setattr(
+            _paper_writing, "_detect_domain",
+            lambda topic, domains=(): ("ml", "machine learning", "NeurIPS, ICML, ICLR"),
+        )
+
         llm = FakeLLMClient("should not be called")
         result = rc_executor._execute_paper_draft(
             stage_dir, run_dir, rc_config, adapters, llm=llm
         )
 
-        assert result.status == StageStatus.FAILED
+        # PAUSED with explicit decision + meta artifact (cleanup of the
+        # previous FAILED + "unknown error" framing).
+        assert result.status == StageStatus.PAUSED
+        assert result.decision == "blocked_no_metrics"
+        assert "no real metrics" in (result.error or "")
         draft = (stage_dir / "paper_draft.md").read_text(encoding="utf-8")
         assert "Blocked" in draft or "BLOCKED" in draft or "no metrics" in draft.lower()
+        meta = json.loads((stage_dir / "paper_meta.json").read_text(encoding="utf-8"))
+        assert meta["outcome"] == "blocked_no_metrics"
+        # LLM should NOT have been called
+        assert len(llm.calls) == 0
+
+    def test_paper_draft_blocked_with_simulated_data(
+        self, tmp_path: Path, run_dir: Path, rc_config: RCConfig, adapters: AdapterBundle,
+    ) -> None:
+        # All run files report status="simulated" → R10 block fires.
+        # Post-cleanup: PAUSED with paper_meta.json and decision="blocked_simulated_data".
+        _write_prior_artifact(run_dir, 16, "outline.md", "# Outline\n## Abstract\n")
+        runs_dir = run_dir / "stage-12" / "runs"
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        for i in range(2):
+            (runs_dir / f"run-{i + 1}.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": f"run-{i + 1}",
+                        "status": "simulated",
+                        "key_metrics": {"primary_metric": 0.3 + i * 0.03},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        stage_dir = run_dir / "stage-17"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
+        llm = FakeLLMClient("should not be called")
+        result = rc_executor._execute_paper_draft(
+            stage_dir, run_dir, rc_config, adapters, llm=llm
+        )
+
+        assert result.status == StageStatus.PAUSED
+        assert result.decision == "blocked_simulated_data"
+        assert "simulated" in (result.error or "").lower()
+        assert (stage_dir / "paper_draft.md").exists()
+        meta = json.loads((stage_dir / "paper_meta.json").read_text(encoding="utf-8"))
+        assert meta["outcome"] == "blocked_simulated_data"
+        assert meta.get("is_literature_first_topic") is False
         # LLM should NOT have been called
         assert len(llm.calls) == 0
 
@@ -2420,8 +2677,10 @@ class TestExperimentHarness:
 
         sandbox.run_project(project, timeout_sec=5)
 
-        # Check that harness was injected
-        harness_path = tmp_path / "sandbox" / "_project" / "experiment_harness.py"
+        # Check that harness was injected (BUG-DA8-06: dir is now _project_{N})
+        project_dirs = list((tmp_path / "sandbox").glob("_project_*"))
+        assert project_dirs, "No _project_N directory found"
+        harness_path = project_dirs[0] / "experiment_harness.py"
         assert harness_path.exists()
         content = harness_path.read_text(encoding="utf-8")
         assert "ExperimentHarness" in content
@@ -2442,8 +2701,10 @@ class TestExperimentHarness:
 
         sandbox.run_project(project, timeout_sec=5)
 
-        # The real harness should be there, not the fake one
-        harness_path = tmp_path / "sandbox" / "_project" / "experiment_harness.py"
+        # The real harness should be there, not the fake one (BUG-DA8-06)
+        project_dirs = list((tmp_path / "sandbox").glob("_project_*"))
+        assert project_dirs
+        harness_path = project_dirs[0] / "experiment_harness.py"
         content = harness_path.read_text(encoding="utf-8")
         assert "ExperimentHarness" in content
         assert "FAKE HARNESS" not in content
@@ -3247,8 +3508,239 @@ class TestValidateDraftQuality:
         rc_executor._validate_draft_quality(draft, stage_dir=tmp_path)
         assert (tmp_path / "draft_quality.json").exists()
         data = json.loads(
-            (tmp_path / "draft_quality.json").read_text()
+            (tmp_path / "draft_quality.json").read_text(encoding="utf-8")
         )
         assert "section_analysis" in data
         assert "overall_warnings" in data
         assert "revision_directives" in data
+
+
+class TestExperimentValidatorPrecision:
+    def test_deep_validation_detects_undefined_helper_calls(self) -> None:
+        from researchclaw.experiment.validator import deep_validate_files
+
+        issues = deep_validate_files(
+            {
+                "main.py": (
+                    "def main():\n"
+                    "    create_empty_csv('tmp.csv', ['a'])\n\n"
+                    "if __name__ == '__main__':\n"
+                    "    main()\n"
+                )
+            }
+        )
+
+        assert any(
+            "Call to undefined function 'create_empty_csv()'" in issue
+            for issue in issues
+        )
+
+    def test_deep_validation_allows_inherited_single_core_method_subclass(
+        self,
+    ) -> None:
+        from researchclaw.experiment.validator import deep_validate_files
+
+        issues = deep_validate_files(
+            {
+                "main.py": (
+                    "class BaseVerifier:\n"
+                    "    def __init__(self, scale=1.0):\n"
+                    "        self.scale = float(scale)\n\n"
+                    "class ChildVerifier(BaseVerifier):\n"
+                    "    def predict(self, value):\n"
+                    "        total = value * self.scale\n"
+                    "        shifted = total + 1.0\n"
+                    "        centered = shifted - 0.5\n"
+                    "        bounded = max(centered, 0.0)\n"
+                    "        return {'score': bounded}\n"
+                )
+            }
+        )
+
+        assert not any(
+            "Class 'ChildVerifier' has only 1 non-dunder method" in issue
+            for issue in issues
+        )
+
+    def test_deep_validation_detects_duplicate_algorithm_classes_across_files(
+        self,
+    ) -> None:
+        from researchclaw.experiment.validator import deep_validate_files
+
+        issues = deep_validate_files(
+            {
+                "main.py": (
+                    "class DuplicateVerifier:\n"
+                    "    def __init__(self, bias=0.0):\n"
+                    "        self.bias = float(bias)\n\n"
+                    "    def predict(self, value):\n"
+                    "        shifted = value + self.bias\n"
+                    "        bounded = max(shifted, 0.0)\n"
+                    "        return {'score': bounded}\n"
+                ),
+                "models.py": (
+                    "class DuplicateVerifier:\n"
+                    "    def __init__(self, bias=0.0):\n"
+                    "        self.bias = float(bias)\n\n"
+                    "    def predict(self, value):\n"
+                    "        shifted = value + self.bias\n"
+                    "        bounded = max(shifted, 0.0)\n"
+                    "        return {'score': bounded}\n"
+                ),
+            }
+        )
+
+        assert any(
+            "Class 'DuplicateVerifier' is defined in multiple files" in issue
+            for issue in issues
+        )
+        assert not any(
+            "Classes 'DuplicateVerifier' and 'DuplicateVerifier' have identical"
+            in issue
+            for issue in issues
+        )
+
+
+# ============================================================
+# IMP-21: Stage 6 (knowledge_extract) refuses to run on empty shortlist
+# ============================================================
+
+
+class TestIMP21_KnowledgeExtractEmptyShortlistGate:
+    """IMP-21: Stage 6 must short-circuit when Stage 5
+    (literature_screen) has produced no shortlist (PAUSED state with
+    ``decision="rejected_all"``). Without this gate, Stage 6 spends an
+    LLM turn extracting cards from empty input, produces low-quality
+    fallback content, and lets downstream stages cascade on garbage.
+
+    We use ``StageStatus.PAUSED`` (not ``BLOCKED_APPROVAL``) because the
+    runner halts on PAUSED unconditionally, whereas BLOCKED_APPROVAL only
+    halts when ``stop_on_gate=True`` — and ``--auto-approve`` explicitly
+    sets ``stop_on_gate=False``, which is the exact scenario this gate
+    must prevent the cascade for. Mirrors the existing Stage 5 pattern
+    (literature_screen returns PAUSED with ``decision="rejected_all"``).
+    """
+
+    def test_returns_paused_when_shortlist_missing(
+        self, rc_config: RCConfig, adapters: AdapterBundle, run_dir: Path
+    ) -> None:
+        """No stage-05*/shortlist.jsonl exists → PAUSED (halts pipeline)."""
+        from researchclaw.pipeline.stage_impls._literature import (
+            _execute_knowledge_extract,
+        )
+
+        stage_dir = run_dir / "stage-06"
+        stage_dir.mkdir()
+
+        result = _execute_knowledge_extract(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=rc_config,
+            adapters=adapters,
+            llm=None,  # gate must trigger before any LLM call
+        )
+
+        assert result.status == StageStatus.PAUSED
+        assert result.stage == Stage.KNOWLEDGE_EXTRACT
+        assert result.error is not None
+        assert "shortlist" in result.error.lower()
+        assert result.decision == "upstream_blocked"
+        meta_path = stage_dir / "knowledge_meta.json"
+        assert meta_path.is_file(), "Gate must write knowledge_meta.json"
+        meta = json.loads(meta_path.read_text())
+        assert meta["outcome"] == "upstream_empty_shortlist"
+        assert meta["shortlist_rows"] == 0
+
+    def test_returns_paused_when_shortlist_empty_string(
+        self, rc_config: RCConfig, adapters: AdapterBundle, run_dir: Path
+    ) -> None:
+        """stage-05/shortlist.jsonl exists but is 0-byte → PAUSED."""
+        from researchclaw.pipeline.stage_impls._literature import (
+            _execute_knowledge_extract,
+        )
+
+        s5_dir = run_dir / "stage-05"
+        s5_dir.mkdir()
+        (s5_dir / "shortlist.jsonl").write_text("", encoding="utf-8")
+
+        stage_dir = run_dir / "stage-06"
+        stage_dir.mkdir()
+
+        result = _execute_knowledge_extract(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=rc_config,
+            adapters=adapters,
+            llm=None,
+        )
+
+        assert result.status == StageStatus.PAUSED
+        assert "stage-06/knowledge_meta.json" in result.evidence_refs
+
+    def test_returns_paused_when_shortlist_only_whitespace(
+        self, rc_config: RCConfig, adapters: AdapterBundle, run_dir: Path
+    ) -> None:
+        """stage-05/shortlist.jsonl is just whitespace → PAUSED."""
+        from researchclaw.pipeline.stage_impls._literature import (
+            _execute_knowledge_extract,
+        )
+
+        s5_dir = run_dir / "stage-05"
+        s5_dir.mkdir()
+        (s5_dir / "shortlist.jsonl").write_text("\n\n  \n", encoding="utf-8")
+
+        stage_dir = run_dir / "stage-06"
+        stage_dir.mkdir()
+
+        result = _execute_knowledge_extract(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=rc_config,
+            adapters=adapters,
+            llm=None,
+        )
+
+        assert result.status == StageStatus.PAUSED
+
+    def test_proceeds_when_shortlist_has_at_least_one_row(
+        self, rc_config: RCConfig, adapters: AdapterBundle, run_dir: Path
+    ) -> None:
+        """stage-05/shortlist.jsonl has >=1 valid row → gate passes,
+        stage proceeds (but exits early since llm=None and no real
+        cards can be generated, so we just assert it didn't BLOCK)."""
+        from researchclaw.pipeline.stage_impls._literature import (
+            _execute_knowledge_extract,
+        )
+
+        s5_dir = run_dir / "stage-05"
+        s5_dir.mkdir()
+        (s5_dir / "shortlist.jsonl").write_text(
+            json.dumps(
+                {
+                    "paper_id": "oalex-W123",
+                    "title": "A Real Paper About Label Noise",
+                    "abstract": "We study symmetric noise on MNIST.",
+                    "year": 2024,
+                    "cite_key": "doe2024noise",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        stage_dir = run_dir / "stage-06"
+        stage_dir.mkdir()
+
+        result = _execute_knowledge_extract(
+            stage_dir=stage_dir,
+            run_dir=run_dir,
+            config=rc_config,
+            adapters=adapters,
+            llm=None,  # no LLM, but gate must not trigger
+        )
+
+        # Gate did NOT trigger — stage proceeded past the check.
+        # Without an LLM, the stage falls back to a template-card path,
+        # which is its existing behaviour (not gated by IMP-21).
+        assert result.status != StageStatus.PAUSED
+        assert result.stage == Stage.KNOWLEDGE_EXTRACT

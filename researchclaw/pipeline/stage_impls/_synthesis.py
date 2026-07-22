@@ -42,6 +42,7 @@ def _execute_synthesis(
         for path in sorted(Path(cards_path).glob("*.md"))[:24]:
             snippets.append(path.read_text(encoding="utf-8"))
         cards_context = "\n\n".join(snippets)
+
     if llm is not None:
         _pm = prompts or PromptManager()
         _overlay = _get_evolution_overlay(run_dir, "synthesis")
@@ -50,6 +51,7 @@ def _execute_synthesis(
             evolution_overlay=_overlay,
             topic=config.research.topic,
             cards_context=cards_context,
+            domain_context="",
         )
         resp = llm.chat(
             [{"role": "user", "content": sp.user}],
@@ -97,15 +99,19 @@ def _execute_hypothesis_gen(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     synthesis = _read_prior_artifact(run_dir, "synthesis.md") or ""
+
     if llm is not None:
         _pm = prompts or PromptManager()
-        from researchclaw.prompts import DEBATE_ROLES_HYPOTHESIS  # noqa: PLC0415
+        # Debate roles come from the PromptManager's active bank
+        # (ML bank -> innovator/pragmatist/contrarian,
+        #  HEP bank -> theorist/phenomenologist/experimentalist).
+        _active_roles = _pm.debate_roles_hypothesis()
 
         # --- Multi-perspective debate ---
         perspectives_dir = stage_dir / "perspectives"
         variables = {"topic": config.research.topic, "synthesis": synthesis}
         perspectives = _multi_perspective_generate(
-            llm, DEBATE_ROLES_HYPOTHESIS, variables, perspectives_dir
+            llm, _active_roles, variables, perspectives_dir
         )
         # BUG-S2: If all debate perspectives failed, fall back to defaults
         # instead of sending empty context to the LLM (pure hallucination).
@@ -119,6 +125,42 @@ def _execute_hypothesis_gen(
             )
     else:
         hypotheses_md = _default_hypotheses(config.research.topic)
+    # --- HITL: Read human guidance if available ---
+    guidance_file = stage_dir / "hitl_guidance.md"
+    if guidance_file.exists():
+        try:
+            guidance = guidance_file.read_text(encoding="utf-8").strip()
+            if guidance and llm is not None:
+                logger.info("Applying HITL guidance to hypotheses")
+                resp = llm.chat(
+                    [{"role": "user", "content": (
+                        f"Refine the following hypotheses based on this human guidance.\n\n"
+                        f"## Current Hypotheses\n{hypotheses_md}\n\n"
+                        f"## Human Guidance\n{guidance}\n\n"
+                        f"Produce improved hypotheses that incorporate the guidance."
+                    )}],
+                    max_tokens=4096,
+                )
+                hypotheses_md = resp.content
+        except Exception:
+            logger.debug("HITL guidance application failed (non-blocking)")
+
+    # --- HITL: Idea Workshop data persistence ---
+    try:
+        from researchclaw.hitl.workshops.idea import IdeaWorkshop
+
+        workshop = IdeaWorkshop(run_dir, llm_client=llm)
+        workshop.candidates = [
+            type("IC", (), {"title": "Generated Hypothesis", "description": hypotheses_md[:500],
+                            "to_dict": lambda self: {"title": self.title, "description": self.description},
+                            "human_approved": False, "baselines": [], "keywords": [],
+                            "novelty_notes": "", "feasibility_notes": "", "impact_notes": "",
+                            "score": 0.0})()
+        ]
+        workshop.save()
+    except Exception:
+        pass
+
     (stage_dir / "hypotheses.md").write_text(hypotheses_md, encoding="utf-8")
 
     # --- Novelty check (non-blocking) ---

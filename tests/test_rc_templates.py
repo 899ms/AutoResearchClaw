@@ -25,6 +25,8 @@ from researchclaw.templates.converter import (
     _extract_abstract,
     _convert_inline,
     _escape_latex,
+    _escape_algo_line,
+    _render_code_block,
     _build_body,
     _render_table,
     _parse_table_row,
@@ -163,8 +165,15 @@ class TestListConferences:
         assert "neurips_2025" in names
         assert "iclr_2026" in names
         assert "icml_2026" in names
-        # Should be deduplicated — no aliases (6 conference + 1 generic)
-        assert len(names) == 7
+        # HEP-phenomenology templates (physics-collider branch)
+        assert "jhep" in names
+        assert "prd" in names
+        assert "prl" in names
+        assert "prx" in names
+        assert "epjc" in names
+        # Should be deduplicated — no aliases
+        # 6 ML conferences + 1 generic + 5 HEP = 12
+        assert len(names) == 12
 
     def test_sorted(self) -> None:
         names = list_conferences()
@@ -291,6 +300,27 @@ class TestConvertInline:
     def test_dollar_math_preserved(self) -> None:
         result = _convert_inline("the value $x^2$ is")
         assert "$x^2$" in result
+
+    def test_pre_escaped_underscore_not_doubled(self) -> None:
+        """BUG-182: LLM pre-escapes underscores → must NOT double-escape to \\\\_."""
+        result = _convert_inline(r"RawObservation\_PPO\_WithNorm")
+        assert r"\\_" not in result, f"Double-escaped: {result}"
+        assert r"\_" in result
+
+    def test_pre_escaped_underscore_near_math(self) -> None:
+        """BUG-182: Pre-escaped underscore adjacent to math must not break."""
+        result = _convert_inline(
+            r"RawObs\_PPO. Statistics \(\mu_t\) are given"
+        )
+        assert r"\\_" not in result
+        assert r"\_" in result
+        assert r"\(\mu_t\)" in result
+
+    def test_pre_escaped_hash_not_doubled(self) -> None:
+        """BUG-182: Pre-escaped hash should not be double-escaped."""
+        result = _convert_inline(r"Section \#3 details")
+        assert r"\\#" not in result
+        assert r"\#" in result
 
 
 class TestEscapeLatex:
@@ -547,7 +577,7 @@ class TestExportConfig:
         import yaml
         from pathlib import Path
 
-        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text())
+        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text(encoding="utf-8"))
         data["export"] = {
             "target_conference": "icml_2025",
             "authors": "Test Author",
@@ -572,7 +602,7 @@ class TestHitlStageValidation:
         import yaml
         from pathlib import Path
 
-        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text())
+        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text(encoding="utf-8"))
         data.setdefault("security", {})["hitl_required_stages"] = [1, 22, 23]
         result = validate_config(data, check_paths=False)
         assert result.ok, f"Errors: {result.errors}"
@@ -599,7 +629,7 @@ class TestHitlStageValidation:
         import yaml
         from pathlib import Path
 
-        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text())
+        data = yaml.safe_load(Path("config.researchclaw.example.yaml").read_text(encoding="utf-8"))
         data.setdefault("security", {})["hitl_required_stages"] = [24]
         result = validate_config(data, check_paths=False)
         assert not result.ok
@@ -665,3 +695,53 @@ class TestCompletenessWordCountAndBullets:
         warns = check_paper_completeness(secs)
         bullet_warns = [w for w in warns if "bullet" in w.lower() and "Method" in w]
         assert len(bullet_warns) >= 1, f"Expected bullet warning, got: {warns}"
+
+
+# =====================================================================
+# BUG-177: Algorithm pseudocode escaping tests
+# =====================================================================
+
+
+class TestAlgorithmEscaping:
+    """Tests for _escape_algo_line and algorithm rendering in _render_code_block."""
+
+    def test_escape_underscore(self) -> None:
+        assert r"psi\_1" in _escape_algo_line("psi_1")
+
+    def test_escape_hash_comment(self) -> None:
+        result = _escape_algo_line("x = y  # update rule")
+        assert r"\COMMENT{update rule}" in result
+        assert "x = y" in result
+
+    def test_fullline_hash_comment(self) -> None:
+        result = _escape_algo_line("# Initialize buffer")
+        assert result == r"\COMMENT{Initialize buffer}"
+
+    def test_escape_percent(self) -> None:
+        assert r"\%" in _escape_algo_line("accuracy 95%")
+
+    def test_escape_ampersand(self) -> None:
+        assert r"\&" in _escape_algo_line("x & y")
+
+    def test_preserve_latex_commands(self) -> None:
+        result = _escape_algo_line(r"Set $x = \alpha$ and update")
+        assert r"$x = \alpha$" in result
+
+    def test_render_code_block_algo_escapes(self) -> None:
+        code = (
+            "Initialize theta_1, theta_2\n"
+            "for t = 1 to T do\n"
+            "  Sample batch B  # prioritized\n"
+        )
+        result = _render_code_block("algorithm", code)
+        assert r"\begin{algorithm}" in result
+        assert r"\begin{algorithmic}" in result
+        assert r"theta\_1" in result
+        assert r"\COMMENT{prioritized}" in result
+
+    def test_render_code_block_verbatim_no_escape(self) -> None:
+        """Non-algorithm code blocks should use verbatim (no escaping)."""
+        code = "x_1 = y_2  # comment"
+        result = _render_code_block("python", code)
+        assert r"\begin{verbatim}" in result
+        assert "x_1" in result  # NOT escaped in verbatim

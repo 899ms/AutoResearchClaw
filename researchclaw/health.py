@@ -161,7 +161,147 @@ def _is_timeout(exc: BaseException) -> bool:
     return isinstance(reason, (TimeoutError, socket.timeout))
 
 
-def check_llm_connectivity(base_url: str) -> CheckResult:
+def _is_anthropic(base_url: str) -> bool:
+    return "anthropic.com" in base_url.lower()
+
+
+def _anthropic_messages_url(base_url: str) -> str:
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        return f"{root}/messages"
+    return f"{root}/v1/messages"
+
+
+def _anthropic_probe(base_url: str, api_key: str, model: str = "_probe") -> int:
+    """POST a minimal /v1/messages probe and return the HTTP status."""
+    url = _anthropic_messages_url(base_url)
+    payload = json.dumps(
+        {
+            "model": model,
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "."}],
+        }
+    ).encode("utf-8")
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            return 200
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def _check_anthropic_connectivity(base_url: str, api_key: str) -> CheckResult:
+    """llm_connectivity for Anthropic — any HTTP response proves reachability."""
+    url = _anthropic_messages_url(base_url)
+    try:
+        status = _anthropic_probe(base_url, api_key)
+    except urllib.error.URLError as exc:
+        if _is_timeout(exc):
+            return CheckResult(
+                name="llm_connectivity",
+                status="fail",
+                detail="LLM endpoint unreachable",
+                fix="Verify endpoint URL and network connectivity",
+            )
+        return CheckResult(
+            name="llm_connectivity",
+            status="fail",
+            detail=f"LLM connectivity error: {exc.reason}",
+            fix="Verify endpoint URL and network connectivity",
+        )
+    except TimeoutError:
+        return CheckResult(
+            name="llm_connectivity",
+            status="fail",
+            detail="LLM endpoint unreachable",
+            fix="Verify endpoint URL and network connectivity",
+        )
+
+    # 400/404 = bad probe model, 401 = bad key, 429 = rate limit — all still reachable.
+    if status in (200, 400, 401, 403, 404, 429):
+        return CheckResult(
+            name="llm_connectivity",
+            status="pass",
+            detail=f"Reachable (HTTP {status}): {url}",
+        )
+    return CheckResult(
+        name="llm_connectivity",
+        status="fail",
+        detail=f"LLM endpoint HTTP {status}",
+        fix="Check llm.base_url and provider status",
+    )
+
+
+def _check_anthropic_api_key(base_url: str, api_key: str) -> CheckResult:
+    """api_key_valid for Anthropic — 401 means rejected, others mean accepted."""
+    try:
+        status = _anthropic_probe(base_url, api_key)
+    except urllib.error.URLError as exc:
+        return CheckResult(
+            name="api_key_valid",
+            status="warn",
+            detail=f"Could not verify API key: {exc.reason}",
+            fix="Retry when endpoint/network is available",
+        )
+    except TimeoutError:
+        return CheckResult(
+            name="api_key_valid",
+            status="warn",
+            detail="Could not verify API key (timeout)",
+            fix="Retry when endpoint/network is available",
+        )
+
+    if status == 401:
+        return CheckResult(
+            name="api_key_valid",
+            status="fail",
+            detail="Invalid API key",
+            fix="Set a valid API key for the configured endpoint",
+        )
+    # 404 here means "model not found" — the key was accepted before the model lookup.
+    if status in (200, 400, 404, 429):
+        return CheckResult(
+            name="api_key_valid",
+            status="pass",
+            detail="API key accepted",
+        )
+    return CheckResult(
+        name="api_key_valid",
+        status="warn",
+        detail=f"API key check returned HTTP {status}",
+        fix="Verify endpoint health and API key permissions",
+    )
+
+
+def _check_anthropic_models(
+    base_url: str, api_key: str, models: list[str]
+) -> tuple[set[str], set[str]] | None:
+    """Return (available, missing) sets, or None if endpoint unreachable."""
+    available: set[str] = set()
+    missing: set[str] = set()
+    for model in models:
+        try:
+            status = _anthropic_probe(base_url, api_key, model=model)
+        except (urllib.error.URLError, TimeoutError):
+            return None
+        if status == 200:
+            available.add(model)
+        elif status == 404:
+            # Anthropic returns 404 with not_found_error for unknown models.
+            missing.add(model)
+        elif status in (401, 403, 429) or status >= 500:
+            return None
+        else:
+            missing.add(model)
+    return available, missing
+
+
+def check_llm_connectivity(base_url: str, api_key: str = "") -> CheckResult:
     if not base_url.strip():
         return CheckResult(
             name="llm_connectivity",
@@ -170,8 +310,14 @@ def check_llm_connectivity(base_url: str) -> CheckResult:
             fix="Set llm.base_url in config",
         )
 
+    if _is_anthropic(base_url):
+        return _check_anthropic_connectivity(base_url, api_key)
+
     url = _models_url(base_url)
-    req = urllib.request.Request(url, method="HEAD")
+    headers: dict[str, str] = {}
+    if api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, headers=headers, method="HEAD")
 
     try:
         with urllib.request.urlopen(req, timeout=5):
@@ -181,42 +327,37 @@ def check_llm_connectivity(base_url: str) -> CheckResult:
                 detail=f"Reachable: {url}",
             )
     except urllib.error.HTTPError as exc:
-        if exc.code == 405:
-            try:
-                with urllib.request.urlopen(url, timeout=5):
-                    return CheckResult(
-                        name="llm_connectivity",
-                        status="pass",
-                        detail=f"Reachable: {url}",
-                    )
-            except urllib.error.HTTPError as get_exc:
-                return CheckResult(
-                    name="llm_connectivity",
-                    status="fail",
-                    detail=f"LLM endpoint HTTP {get_exc.code}",
-                    fix="Check llm.base_url and provider status",
-                )
-            except urllib.error.URLError as get_exc:
-                if _is_timeout(get_exc):
-                    return CheckResult(
-                        name="llm_connectivity",
-                        status="fail",
-                        detail="LLM endpoint unreachable",
-                        fix="Verify endpoint URL and network connectivity",
-                    )
-                return CheckResult(
-                    name="llm_connectivity",
-                    status="fail",
-                    detail=f"LLM connectivity error: {get_exc.reason}",
-                    fix="Verify endpoint URL and network connectivity",
-                )
-            except TimeoutError:
-                return CheckResult(
-                    name="llm_connectivity",
-                    status="fail",
-                    detail="LLM endpoint unreachable",
-                    fix="Verify endpoint URL and network connectivity",
-                )
+        if exc.code in (404, 405):
+            # /models not available (e.g. MiniMax, some proxies) — try
+            # /chat/completions with HEAD/GET as a fallback probe.
+            fallback_url = f"{base_url.rstrip('/')}/chat/completions"
+            probe_urls = [url, fallback_url] if exc.code == 405 else [fallback_url]
+            for probe in probe_urls:
+                try:
+                    get_req = urllib.request.Request(probe, headers=headers)
+                    with urllib.request.urlopen(get_req, timeout=5):
+                        return CheckResult(
+                            name="llm_connectivity",
+                            status="pass",
+                            detail=f"Reachable: {probe}",
+                        )
+                except urllib.error.HTTPError as get_exc:
+                    # 401/422/405 = endpoint exists but needs auth/body — still reachable
+                    if get_exc.code in (401, 405, 415, 422):
+                        return CheckResult(
+                            name="llm_connectivity",
+                            status="pass",
+                            detail=f"Reachable (HTTP {get_exc.code}): {probe}",
+                        )
+                    continue
+                except urllib.error.URLError:
+                    continue
+            return CheckResult(
+                name="llm_connectivity",
+                status="fail",
+                detail=f"LLM endpoint HTTP {exc.code}",
+                fix="Check llm.base_url and provider status",
+            )
 
         return CheckResult(
             name="llm_connectivity",
@@ -297,6 +438,9 @@ def check_api_key_valid(base_url: str, api_key: str) -> CheckResult:
             detail="API key is empty",
             fix="Set llm.api_key or environment variable defined by llm.api_key_env",
         )
+
+    if _is_anthropic(base_url):
+        return _check_anthropic_api_key(base_url, api_key)
 
     try:
         status, _ = _fetch_models(base_url, api_key)
@@ -428,6 +572,9 @@ def _check_models_against_endpoint(
         models = [m for m in models if m.strip()]
     if not models:
         return set(), set()
+
+    if _is_anthropic(base_url):
+        return _check_anthropic_models(base_url, api_key, models)
 
     try:
         _, payload = _fetch_models(base_url, api_key)
@@ -592,7 +739,7 @@ def run_doctor(config_path: str | Path) -> DoctorReport:
     if provider == "acp":
         checks.append(check_acp_agent(acp_agent_command))
     else:
-        checks.append(check_llm_connectivity(base_url))
+        checks.append(check_llm_connectivity(base_url, api_key))
         checks.append(check_api_key_valid(base_url, api_key))
         checks.append(check_model_chain(base_url, api_key, model, fallback_models))
     checks.append(check_sandbox_python(sandbox_python_path))

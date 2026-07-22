@@ -32,7 +32,7 @@ class TestProfileLoading:
     def test_load_all_profiles_returns_dict(self):
         profiles = load_all_profiles()
         assert isinstance(profiles, dict)
-        assert len(profiles) >= 10  # we created 14 profiles
+        assert len(profiles) >= 10  # currently 24 profiles
 
     def test_profiles_have_required_fields(self):
         profiles = load_all_profiles()
@@ -76,7 +76,9 @@ class TestProfileLoading:
             "biology_singlecell",
             "economics_empirical",
             "security_detection",
+            "clinical_sleep",
             "robotics_control",
+            "medical_observational",
         ]:
             profile = get_profile(domain_id)
             assert profile is not None, f"Missing profile: {domain_id}"
@@ -134,6 +136,15 @@ class TestKeywordDetection:
     def test_security_keywords(self):
         assert _keyword_detect("intrusion detection system for network traffic") == "security_detection"
 
+    def test_clinical_sleep_keywords(self):
+        assert _keyword_detect("sleep apnea detection from polysomnography") == "clinical_sleep"
+        assert _keyword_detect("EEG sleep staging for apnea screening") == "clinical_sleep"
+        assert _keyword_detect("perioperative respiratory depression during sedation monitoring") == "clinical_sleep"
+        assert _keyword_detect("airway management risk prediction after anesthesia") == "clinical_sleep"
+
+    def test_general_eeg_still_routes_to_neuroscience(self):
+        assert _keyword_detect("EEG functional connectivity analysis with MNE") == "neuroscience_imaging"
+
     def test_robotics_keywords(self):
         assert _keyword_detect("robot manipulation with MuJoCo") == "robotics_control"
 
@@ -147,6 +158,34 @@ class TestKeywordDetection:
     def test_case_insensitive(self):
         assert _keyword_detect("IMAGE CLASSIFICATION WITH RESNET") == "ml_vision"
         assert _keyword_detect("DFT Calculation") == "chemistry_qm"
+
+    def test_medical_observational_keywords(self):
+        assert _keyword_detect(
+            "Retrospective cohort study of mortality in trauma registry patients"
+        ) == "medical_observational"
+        assert _keyword_detect("STROBE-guided case-control analysis from EHR data") == "medical_observational"
+        assert _keyword_detect("Cross-sectional HIS database study") == "medical_observational"
+
+    def test_generic_crosssectional_not_hijacked_to_medical(self):
+        # Regression: generic econometric/statistical phrasing must NOT be
+        # routed to medical_observational just because it says "cross-sectional"
+        # or "table 1" (these generic keywords were removed from that profile).
+        assert (
+            _keyword_detect(
+                "Cross-sectional regression analysis of wage inequality"
+            )
+            != "medical_observational"
+        )
+        assert (
+            _keyword_detect(
+                "Cross-sectional study of household income and consumption"
+            )
+            != "medical_observational"
+        )
+        assert (
+            _keyword_detect("Analysis of table 1 summary statistics for A/B test")
+            != "medical_observational"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +340,11 @@ class TestDetectionAccuracy:
         # Security topics
         ("Network intrusion detection system", "security_detection"),
         ("Malware classification using random forest", "security_detection"),
+        # Clinical sleep / perioperative monitoring topics
+        ("Sleep apnea detection from polysomnography", "clinical_sleep"),
+        ("EEG sleep staging for apnea screening", "clinical_sleep"),
+        ("Perioperative respiratory depression during sedation monitoring", "clinical_sleep"),
+        ("Airway management risk prediction after anesthesia", "clinical_sleep"),
         # Robotics topics
         ("Robot manipulation policy learning", "robotics_control"),
         ("Locomotion control with MuJoCo", "robotics_control"),
@@ -337,3 +381,38 @@ class TestDetectionAccuracy:
             f"Full detection accuracy: {accuracy:.1%} ({correct}/{total}). "
             f"Expected > 90%."
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression: drug repurposing must not bleed into chemistry_molprop
+# ---------------------------------------------------------------------------
+
+
+class TestDrugKeywordRegression:
+    """Regression tests for the bare 'drug' keyword removal from chemistry_molprop.
+
+    Previously the chemistry_molprop rule contained a bare 'drug' keyword that
+    caused network-medicine topics (drug repurposing, drug-target interaction)
+    to be routed into chemistry_molprop, injecting RDKit/SMILES/QM9 prompt
+    guidance that overrode the user's domain-specific overrides.
+    """
+
+    def setup_method(self):
+        _profile_cache.clear()
+
+    def test_drug_repurposing_falls_back_to_generic(self):
+        """Network-medicine drug-repurposing topics must NOT misclassify as chemistry."""
+        assert detect_domain_id("COVID-19 drug repurposing using gene-disease associations") == "generic"
+        assert detect_domain_id("Drug repurposing with network medicine") == "generic"
+        assert detect_domain_id("drug-target interaction network analysis") == "generic"
+        assert detect_domain_id("drug-disease association using network propagation") == "generic"
+
+    def test_cheminformatics_topics_still_detected(self):
+        """Real cheminformatics topics must still route to chemistry_molprop
+        via the more specific keywords that replaced the bare 'drug'."""
+        # New specific keywords added by this patch
+        assert _keyword_detect("QSAR model with Morgan fingerprints") == "chemistry_molprop"
+        assert _keyword_detect("ECFP fingerprint for binding affinity") == "chemistry_molprop"
+        # Pre-existing keywords (rdkit, binding affinity, admet) still trigger
+        assert _keyword_detect("Drug binding affinity with RDKit fingerprints") == "chemistry_molprop"
+        assert _keyword_detect("ADMET descriptor prediction") == "chemistry_molprop"

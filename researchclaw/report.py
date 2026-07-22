@@ -118,7 +118,14 @@ def _experiment_section(run_dir: Path) -> str:
     else:
         lines.append("- Results: not available")
 
+    # BUG-215: Also search stage-14* versioned dirs when stage-14/ is missing.
     analysis_path = run_dir / "stage-14" / "analysis.md"
+    if not analysis_path.exists():
+        for _s14 in sorted(run_dir.glob("stage-14*"), reverse=True):
+            _alt = _s14 / "analysis.md"
+            if _alt.exists():
+                analysis_path = _alt
+                break
     if analysis_path.exists():
         lines.append(f"- Analysis: `{analysis_path.relative_to(run_dir)}`")
 
@@ -144,10 +151,22 @@ def _citation_section(run_dir: Path) -> str:
         try:
             loaded = json.loads(verify_path.read_text(encoding="utf-8"))
             vdata = loaded if isinstance(loaded, dict) else {}
-            total = int(vdata.get("total_references", 0))
-            verified = int(vdata.get("verified_count", 0))
-            suspicious = int(vdata.get("suspicious_count", 0))
-            hallucinated = int(vdata.get("hallucinated_count", 0))
+            # VerificationReport.to_dict() nests the counts under "summary"
+            # (keys: total/verified/suspicious/hallucinated). Fall back to the
+            # older flat keys for backward compatibility.
+            summary = vdata.get("summary")
+            if not isinstance(summary, dict):
+                summary = {}
+            total = int(summary.get("total", vdata.get("total_references", 0)))
+            verified = int(
+                summary.get("verified", vdata.get("verified_count", 0))
+            )
+            suspicious = int(
+                summary.get("suspicious", vdata.get("suspicious_count", 0))
+            )
+            hallucinated = int(
+                summary.get("hallucinated", vdata.get("hallucinated_count", 0))
+            )
             pct = f"{verified / total * 100:.1f}%" if total > 0 else "N/A"
             lines.append(f"- Verified: {verified}/{total} ({pct})")
             if suspicious:

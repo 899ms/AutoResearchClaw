@@ -6,6 +6,7 @@ import pytest
 
 from researchclaw.config import (
     ExperimentConfig,
+    LiteratureSearchConfig,
     RCConfig,
     SandboxConfig,
     SecurityConfig,
@@ -142,6 +143,25 @@ def test_validate_config_rejects_invalid_knowledge_base_backend(tmp_path: Path):
     assert "Invalid knowledge_base.backend: sqlite" in result.errors
 
 
+def test_validate_config_accepts_llm_wire_api_responses(tmp_path: Path):
+    data = _valid_config_data()
+    data["llm"]["wire_api"] = "responses"
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is True
+
+
+def test_validate_config_rejects_invalid_llm_wire_api(tmp_path: Path):
+    data = _valid_config_data()
+    data["llm"]["wire_api"] = "responses_only"
+
+    result = validate_config(data, project_root=tmp_path, check_paths=False)
+
+    assert result.ok is False
+    assert "Invalid llm.wire_api: responses_only" in result.errors
+
+
 @pytest.mark.parametrize("entry", [0, 24, "5", 9.1])
 def test_validate_config_rejects_invalid_hitl_required_stages_entries(
     tmp_path: Path, entry: object
@@ -207,6 +227,58 @@ def test_rcconfig_from_dict_happy_path(tmp_path: Path):
     assert config.llm.fallback_models == ("gpt-4o-mini", "gpt-4o")
 
 
+def test_rcconfig_from_dict_parses_llm_wire_api(tmp_path: Path):
+    data = _valid_config_data()
+    data["llm"]["wire_api"] = "responses"
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    assert config.llm.wire_api == "responses"
+
+
+def test_rcconfig_from_dict_uses_default_literature_search(tmp_path: Path):
+    config = RCConfig.from_dict(
+        _valid_config_data(),
+        project_root=tmp_path,
+        check_paths=False,
+    )
+
+    assert isinstance(config.literature_search, LiteratureSearchConfig)
+    assert config.literature_search.sources == (
+        "openalex",
+        "semantic_scholar",
+        "arxiv",
+    )
+    assert config.literature_search.max_results_per_query == 40
+    assert config.literature_search.openalex_api_key_env == "OPENALEX_API_KEY"
+    assert config.literature_search.s2_api_key_env == "S2_API_KEY"
+
+
+def test_rcconfig_from_dict_parses_literature_search(tmp_path: Path):
+    data = _valid_config_data()
+    data["literature_search"] = {
+        "sources": ["openalex", "arxiv"],
+        "max_results_per_query": 12,
+        "inter_query_delay_sec": 0.25,
+        "openalex_email": "bot@example.com",
+        "openalex_api_key_env": "CUSTOM_OPENALEX_KEY",
+        "openalex_api_key": "openalex-test-key",
+        "s2_api_key_env": "CUSTOM_S2_KEY",
+        "s2_api_key": "s2-test-key",
+    }
+
+    config = RCConfig.from_dict(data, project_root=tmp_path, check_paths=False)
+
+    assert config.literature_search.sources == ("openalex", "arxiv")
+    assert config.literature_search.max_results_per_query == 12
+    assert config.literature_search.inter_query_delay_sec == 0.25
+    assert config.literature_search.openalex_email == "bot@example.com"
+    assert config.literature_search.openalex_api_key_env == "CUSTOM_OPENALEX_KEY"
+    assert config.literature_search.openalex_api_key == "openalex-test-key"
+    assert config.literature_search.s2_api_key_env == "CUSTOM_S2_KEY"
+    assert config.literature_search.s2_api_key == "s2-test-key"
+
+
 def test_rcconfig_from_dict_missing_fields_raises_value_error(tmp_path: Path):
     data = _valid_config_data()
     del data["runtime"]
@@ -249,6 +321,7 @@ def test_experiment_config_defaults_mode_is_simulated():
 
 def test_sandbox_config_defaults_match_expected_values():
     from researchclaw.config import DEFAULT_PYTHON_PATH
+
     defaults = SandboxConfig()
 
     assert defaults.python_path == DEFAULT_PYTHON_PATH

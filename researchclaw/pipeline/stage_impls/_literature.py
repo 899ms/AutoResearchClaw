@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -120,6 +121,7 @@ def _execute_search_strategy(
             src = payload.get("sources", [])
             if isinstance(src, list):
                 sources = [item for item in src if isinstance(item, dict)]
+    model_plan_parsed = plan is not None
     if plan is None:
         # Build smart fallback queries by extracting key terms from topic
         # instead of using the raw (often very long) topic string.
@@ -204,6 +206,18 @@ def _execute_search_strategy(
                     qs = strat.get("queries", [])
                     if isinstance(qs, list):
                         queries_list.extend(str(q) for q in qs if q)
+        # Also accept the alternate schema where queries live under
+        # query_strategies.<sub_question>.{boolean_seeds, queries}.
+        if not queries_list:
+            qstrats = plan.get("query_strategies", {})
+            if isinstance(qstrats, dict):
+                for sub in qstrats.values():
+                    if not isinstance(sub, dict):
+                        continue
+                    for key in ("boolean_seeds", "queries"):
+                        qs = sub.get(key, [])
+                        if isinstance(qs, list):
+                            queries_list.extend(str(q) for q in qs if q)
         filters = plan.get("filters", {})
         if isinstance(filters, dict) and filters.get("min_year"):
             try:
@@ -220,10 +234,11 @@ def _execute_search_strategy(
         "via", "using", "based", "study", "analysis", "empirical",
         "towards", "toward", "into", "exploring", "comparison", "tasks",
         "effectiveness", "investigation", "comprehensive", "novel",
+        "challenge", "challenges", "gaps", "gap", "critical", "survey", "review",
     }
 
-    def _extract_keywords(text: str) -> list[str]:
-        """Extract meaningful keywords from text, removing stop words."""
+    def _extract_search_terms(text: str) -> list[str]:
+        """Extract meaningful search terms from text, removing stop words."""
         return [
             w for w in re.split(r"[^a-zA-Z0-9]+", text)
             if w.lower() not in _stop and len(w) > 1
@@ -244,7 +259,7 @@ def _execute_search_strategy(
                 q_core = q_stripped[: -len(sfx)].strip()
                 break
         # Extract keywords from the core part
-        kws = _extract_keywords(q_core)
+        kws = _extract_search_terms(q_core)
         shortened = " ".join(kws[:max_kw])
         if suffix:
             shortened = f"{shortened} {suffix}"
@@ -261,19 +276,29 @@ def _execute_search_strategy(
                 sanitized.append(q)
         queries_list = sanitized
 
-    if not queries_list:
-        # Build diverse keyword queries from the topic
-        _words = _extract_keywords(topic)
+    def _build_default_search_queries(topic_text: str) -> list[str]:
+        """Generate concept-style search queries from the topic instead of copying the title."""
+        _words = _extract_search_terms(topic_text)
+        if not _words:
+            return [topic_text[:60]]
         kw_primary = " ".join(_words[:6])
         kw_short = " ".join(_words[:4])
-        queries_list = [
+        kw_alt = " ".join(_words[1:5]) if len(_words) > 4 else kw_short
+        return [
             kw_primary,
             f"{kw_short} benchmark",
             f"{kw_short} survey",
+            kw_alt,
+            f"{kw_short} recent advances",
         ]
 
+    fell_back_to_defaults = False
+    if not queries_list:
+        queries_list = _build_default_search_queries(topic)
+        fell_back_to_defaults = True
+
     # Ensure minimum query diversity — if dedup leaves too few, add variants
-    _all_kw = _extract_keywords(topic)
+    _all_kw = _extract_search_terms(topic)
     _seen_q: set[str] = set()
     unique_queries: list[str] = []
     for q in queries_list:
@@ -299,8 +324,22 @@ def _execute_search_strategy(
             if len(unique_queries) >= 8:
                 break
     queries_list = unique_queries
+    silent_fallback = fell_back_to_defaults and model_plan_parsed
+    if silent_fallback:
+        logger.warning(
+            "Stage 3: model plan parsed but no queries harvested; "
+            "queries.json fell back to topic-derived defaults"
+        )
+    queries_meta = {
+        "queries": queries_list,
+        "year_min": year_min,
+        "model_queries_extracted": model_plan_parsed and not fell_back_to_defaults,
+        "fallback_reason": (
+            "model_plan_used_unknown_schema" if silent_fallback else None
+        ),
+    }
     (stage_dir / "queries.json").write_text(
-        json.dumps({"queries": queries_list, "year_min": year_min}, indent=2),
+        json.dumps(queries_meta, indent=2),
         encoding="utf-8",
     )
     return StageResult(
@@ -346,17 +385,32 @@ def _execute_literature_collect(
 
         # Expand queries for broader coverage
         expanded_queries = _expand_search_queries(queries, config.research.topic)
+        literature_config = config.literature_search
+        s2_api_key = (
+            literature_config.s2_api_key
+            or config.llm.s2_api_key
+            or os.environ.get(literature_config.s2_api_key_env, "")
+        )
+        openalex_api_key = (
+            literature_config.openalex_api_key
+            or os.environ.get(literature_config.openalex_api_key_env, "")
+        )
         logger.info(
             "[literature] Searching %d queries (expanded from %d) "
-            "across OpenAlex → S2 → arXiv…",
+            "across %s",
             len(expanded_queries),
             len(queries),
+            " -> ".join(literature_config.sources),
         )
         papers = search_papers_multi_query(
             expanded_queries,
-            limit_per_query=40,
+            limit_per_query=literature_config.max_results_per_query,
+            sources=literature_config.sources,
             year_min=year_min,
-            s2_api_key=config.llm.s2_api_key,
+            s2_api_key=s2_api_key,
+            openalex_email=literature_config.openalex_email,
+            openalex_api_key=openalex_api_key,
+            inter_query_delay=literature_config.inter_query_delay_sec,
         )
         if papers:
             real_search_succeeded = True
@@ -590,6 +644,10 @@ def _execute_literature_collect(
     )
 
 
+_MAX_ABSTRACT_LEN = 800  # Truncate long abstracts to reduce token usage
+_MAX_CANDIDATES_CHARS = 30_000  # Cap total candidates text sent to LLM
+
+
 def _execute_literature_screen(
     stage_dir: Path,
     run_dir: Path,
@@ -628,10 +686,26 @@ def _execute_literature_screen(
     # If pre-filter dropped everything, fall back to original (safety valve)
     if not filtered_rows:
         filtered_rows = _parse_jsonl_rows(candidates_text)
+    # Truncate abstracts and strip authors to reduce token usage
+    for row in filtered_rows:
+        abstract = row.get("abstract", "")
+        if isinstance(abstract, str) and len(abstract) > _MAX_ABSTRACT_LEN:
+            row["abstract"] = abstract[:_MAX_ABSTRACT_LEN] + "..."
+        # Strip authors list — not needed for screening and inflates tokens
+        row.pop("authors", None)
+
     # Rebuild candidates_text from filtered rows
     candidates_text = "\n".join(
         json.dumps(r, ensure_ascii=False) for r in filtered_rows
     )
+    # Cap total candidates text size to avoid blowing token budget
+    if len(candidates_text) > _MAX_CANDIDATES_CHARS:
+        # Truncate at newline boundary to avoid cutting mid-JSON-line
+        candidates_text = candidates_text[:_MAX_CANDIDATES_CHARS].rsplit("\n", 1)[0]
+        logger.info(
+            "Candidates text truncated to %d chars for screening",
+            len(candidates_text),
+        )
     logger.info(
         "Domain pre-filter: kept %d, dropped %d (keywords: %s)",
         len(filtered_rows),
@@ -640,6 +714,8 @@ def _execute_literature_screen(
     )
 
     shortlist: list[dict[str, Any]] = []
+    model_rejected_all = False
+    parse_failed = False
     if llm is not None:
         _pm = prompts or PromptManager()
         _overlay = _get_evolution_overlay(run_dir, "literature_screen")
@@ -661,10 +737,52 @@ def _execute_literature_screen(
             max_tokens=sp.max_tokens,
         )
         payload = _safe_json_loads(resp.content, {})
-        if isinstance(payload, dict) and isinstance(payload.get("shortlist"), list):
-            shortlist = [row for row in payload["shortlist"] if isinstance(row, dict)]
+        raw = payload.get("shortlist") if isinstance(payload, dict) else None
+        if isinstance(raw, list):
+            if len(raw) == 0:
+                # Distinguish a valid strict-screen empty result from a
+                # malformed list whose entries are not dicts.
+                model_rejected_all = True
+            else:
+                shortlist = [row for row in raw if isinstance(row, dict)]
+                if not shortlist:
+                    parse_failed = True
+        else:
+            parse_failed = True
     # T2.2: Ensure minimum shortlist size of 15 for adequate related work
     _MIN_SHORTLIST = 15
+    if model_rejected_all:
+        # Strict screen returned an empty shortlist — do not backfill with
+        # rejected papers. Pause the pipeline so the user can decide whether
+        # to refine the search or accept the rejection.
+        (stage_dir / "screen_meta.json").write_text(
+            json.dumps(
+                {
+                    "outcome": "model_rejected_all",
+                    "candidates_screened": len(filtered_rows),
+                    "shortlist_size": 0,
+                    "note": (
+                        "Strict screen returned empty shortlist. Pipeline paused; "
+                        "consider rerunning SEARCH_STRATEGY with refined queries "
+                        "before resuming."
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        logger.warning(
+            "Stage 5: model rejected all %d candidates — pausing pipeline",
+            len(filtered_rows),
+        )
+        return StageResult(
+            stage=Stage.LITERATURE_SCREEN,
+            status=StageStatus.PAUSED,
+            artifacts=("screen_meta.json",),
+            error="Model returned empty shortlist after strict screening",
+            evidence_refs=("stage-05/screen_meta.json",),
+            decision="rejected_all",
+        )
     if not shortlist:
         rows = (
             filtered_rows[:_MIN_SHORTLIST]
@@ -674,7 +792,11 @@ def _execute_literature_screen(
         for idx, item in enumerate(rows):
             item["relevance_score"] = round(0.75 - idx * 0.02, 3)
             item["quality_score"] = round(0.72 - idx * 0.015, 3)
-            item["keep_reason"] = "Template screened entry"
+            item["keep_reason"] = (
+                "Template fallback (parse failure)"
+                if parse_failed
+                else "Template screened entry"
+            )
             shortlist.append(item)
     elif len(shortlist) < _MIN_SHORTLIST:
         # T2.2: LLM returned too few — supplement from filtered candidates
@@ -715,6 +837,53 @@ def _execute_knowledge_extract(
     prompts: PromptManager | None = None,
 ) -> StageResult:
     shortlist = _read_prior_artifact(run_dir, "shortlist.jsonl") or ""
+
+    # IMP-21: Defensive gate — refuse to run on an empty/missing shortlist.
+    # Stage 5 (LITERATURE_SCREEN) returns PAUSED with decision="rejected_all"
+    # when its strict screen rejects all candidates, in which case no
+    # shortlist.jsonl is written. Without this gate, Stage 6 spends an LLM
+    # turn extracting knowledge cards from empty input, produces low-quality
+    # fallback cards, and lets downstream stages cascade on garbage.
+    #
+    # We return PAUSED (mirroring Stage 5's pattern) rather than
+    # BLOCKED_APPROVAL because the runner halts on PAUSED unconditionally
+    # (runner.py: ``if result.status == StageStatus.PAUSED: break``), whereas
+    # BLOCKED_APPROVAL only halts when ``stop_on_gate=True`` — and
+    # ``--auto-approve`` explicitly sets ``stop_on_gate=False``, which is
+    # the exact scenario this gate must prevent the cascade for.
+    if not _parse_jsonl_rows(shortlist):
+        logger.warning(
+            "Stage 6: shortlist.jsonl is empty or missing — Stage 5 likely "
+            "rejected all candidates. Refusing to extract from empty input."
+        )
+        (stage_dir / "knowledge_meta.json").write_text(
+            json.dumps(
+                {
+                    "outcome": "upstream_empty_shortlist",
+                    "shortlist_rows": 0,
+                    "note": (
+                        "Stage 6 (knowledge_extract) requires a non-empty "
+                        "shortlist.jsonl from Stage 5 (literature_screen). "
+                        "Resolve Stage 5 (refine search queries, manually "
+                        "approve a shortlist, or restart from "
+                        "search_strategy) before resuming."
+                    ),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return StageResult(
+            stage=Stage.KNOWLEDGE_EXTRACT,
+            status=StageStatus.PAUSED,
+            artifacts=("knowledge_meta.json",),
+            error=(
+                "Cannot extract knowledge cards: shortlist.jsonl is empty "
+                "or missing. Resolve Stage 5 (literature_screen) first."
+            ),
+            evidence_refs=("stage-06/knowledge_meta.json",),
+            decision="upstream_blocked",
+        )
 
     # Inject web context from Stage 4 if available
     web_context = _read_prior_artifact(run_dir, "web_context.md") or ""
